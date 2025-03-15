@@ -166,6 +166,17 @@ def get_compute_metrics_fn(tokenizer):
         """Compute metrics for evaluation."""
         preds, labels = eval_preds
         
+        # Debug information
+        print("\n===== DEBUGGING COMPUTE_METRICS =====")
+        print(f"Predictions type: {type(preds)}")
+        print(f"Predictions shape: {preds.shape if hasattr(preds, 'shape') else 'No shape attribute'}")
+        print(f"Labels type: {type(labels)}")
+        print(f"Labels shape: {labels.shape if hasattr(labels, 'shape') else 'No shape attribute'}")
+        
+        if len(preds) > 0:
+            print(f"First prediction type: {type(preds[0])}")
+            print(f"First prediction sample: {preds[0][:10] if len(preds[0]) > 10 else preds[0]}")
+        
         # Replace -100 with pad token id
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         
@@ -177,8 +188,28 @@ def get_compute_metrics_fn(tokenizer):
         
         for i in range(0, num_samples, batch_size):
             end_idx = min(i + batch_size, num_samples)
-            pred_str.extend(tokenizer.batch_decode(preds[i:end_idx], skip_special_tokens=True))
-            label_str.extend(tokenizer.batch_decode(labels[i:end_idx], skip_special_tokens=True))
+            # Convert numpy arrays to lists of integers for batch_decode
+            pred_batch = [pred.tolist() for pred in preds[i:end_idx]]
+            label_batch = [label.tolist() for label in labels[i:end_idx]]
+            
+            # Decode each sequence individually to avoid type errors
+            for pred in pred_batch:
+                try:
+                    decoded = tokenizer.decode(pred, skip_special_tokens=True)
+                    pred_str.append(decoded)
+                except Exception as e:
+                    print(f"Error decoding prediction: {e}")
+                    print(f"Prediction type: {type(pred)}, content: {pred[:10]}...")
+                    pred_str.append("")
+            
+            for label in label_batch:
+                try:
+                    decoded = tokenizer.decode(label, skip_special_tokens=True)
+                    label_str.append(decoded)
+                except Exception as e:
+                    print(f"Error decoding label: {e}")
+                    print(f"Label type: {type(label)}, content: {label[:10]}...")
+                    label_str.append("")
         
         # Extract program tokens and answers
         def extract_program_tokens(text):
@@ -230,8 +261,8 @@ def get_compute_metrics_fn(tokenizer):
                 answer_matches += 1
         
         # Calculate metrics
-        program_match_percentage = program_matches / len(pred_str) * 100
-        answer_match_percentage = answer_matches / len(pred_str) * 100
+        program_match_percentage = program_matches / max(1, len(pred_str)) * 100
+        answer_match_percentage = answer_matches / max(1, len(pred_str)) * 100
         
         # Log examples to wandb
         if wandb.run:
