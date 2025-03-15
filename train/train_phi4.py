@@ -23,11 +23,12 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default="/workspace/mnt/watt/public_models", help="Cache directory for models")
     parser.add_argument("--dataset_name", type=str, default="christlurker/finqa_sharegpt", help="Dataset to use for training")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save model checkpoints")
-    parser.add_argument("--max_seq_length", type=int, default=8192, help="Maximum sequence length")
+    parser.add_argument("--max_seq_length", type=int, default=4096, help="Maximum sequence length")
     parser.add_argument("--load_in_4bit", action="store_true", default=True, help="Whether to load in 4-bit quantization")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
+    parser.add_argument("--eval_batch_size", type=int, default=1, help="Evaluation batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of training epochs")
@@ -35,11 +36,13 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=5, help="Number of warmup steps")
     parser.add_argument("--logging_steps", type=int, default=1, help="Logging steps")
     parser.add_argument("--eval_steps", type=int, default=20, help="Evaluation steps")
-    parser.add_argument("--save_steps", type=int, default=50, help="Save checkpoint steps")
+    parser.add_argument("--save_steps", type=int, default=40, help="Save checkpoint steps")
     parser.add_argument("--seed", type=int, default=3407, help="Random seed")
     parser.add_argument("--wandb_project", type=str, default="phi4-lora-sft", help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
     parser.add_argument("--eval_split_percentage", type=int, default=4, help="Percentage of data to use for evaluation")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save memory")
+    parser.add_argument("--max_eval_samples", type=int, default=None, help="Maximum number of samples to use for evaluation")
     args = parser.parse_args()
     
     # Ensure max_steps has a valid value
@@ -57,6 +60,7 @@ def setup_wandb(args):
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "learning_rate": args.learning_rate,
         "max_seq_length": args.max_seq_length,
@@ -64,6 +68,8 @@ def setup_wandb(args):
         "seed": args.seed,
         "max_steps": args.max_steps,
         "num_train_epochs": args.num_train_epochs,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "max_eval_samples": args.max_eval_samples,
     }
     
     run_name = args.wandb_run_name or f"phi4-lora-r{args.lora_r}-bs{args.batch_size*args.gradient_accumulation_steps}"
@@ -90,7 +96,7 @@ def load_model_and_tokenizer(args):
         lora_alpha=args.lora_alpha,
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        use_gradient_checkpointing="unsloth" if args.gradient_checkpointing else None,
         random_state=args.seed,
         use_rslora=False,
         loftq_config=None,
@@ -124,6 +130,11 @@ def prepare_dataset(tokenizer, args):
         dataset = dataset.train_test_split(test_size=args.eval_split_percentage/100, seed=args.seed)
         train_dataset = dataset["train"]
         eval_dataset = dataset["test"]
+        
+        # Limit eval dataset size if specified
+        if args.max_eval_samples is not None and args.max_eval_samples > 0:
+            print(f"Limiting evaluation dataset to {args.max_eval_samples} samples")
+            eval_dataset = eval_dataset.select(range(min(len(eval_dataset), args.max_eval_samples)))
     else:
         train_dataset = dataset
         eval_dataset = None
@@ -145,13 +156,7 @@ def prepare_dataset(tokenizer, args):
     print(f"Train dataset size: {len(train_dataset)}")
     if eval_dataset:
         print(f"Eval dataset size: {len(eval_dataset)}")
-    
-    # Display a sample
-    print("\nSample conversation:")
-    print(train_dataset[0]["conversations"])
-    print("\nFormatted text:")
-    print(train_dataset[0]["text"])
-    
+
     return train_dataset, eval_dataset
 
 
@@ -162,10 +167,17 @@ def compute_metrics(eval_preds):
     # Replace -100 with pad token id
     labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
     
-    # Decode predictions and labels
-    pred_str = tokenizer.batch_decode(preds, skip_special_tokens=True)
-    label_str = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
+    # Process in smaller batches to avoid OOM
+    batch_size = 16
+    num_samples = len(preds)
+    pred_str = []
+    label_str = []
+    
+    for i in range(0, num_samples, batch_size):
+        end_idx = min(i + batch_size, num_samples)
+        pred_str.extend(tokenizer.batch_decode(preds[i:end_idx], skip_special_tokens=True))
+        label_str.extend(tokenizer.batch_decode(labels[i:end_idx], skip_special_tokens=True))
+    
     # Extract program tokens and answers
     def extract_program_tokens(text):
         program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
@@ -240,6 +252,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
@@ -258,8 +271,12 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         seed=args.seed,
         report_to="wandb",  # Enable wandb reporting
         load_best_model_at_end=True if eval_dataset else False,
-        metric_for_best_model="exact_match" if eval_dataset else None,
+        metric_for_best_model="answer_match" if eval_dataset else None,
         greater_is_better=True,
+        gradient_checkpointing=args.gradient_checkpointing,
+        # Add memory optimization options
+        deepspeed=None,  # Let the trainer handle memory optimization
+        ddp_find_unused_parameters=False,
     )
     
     trainer = SFTTrainer(
@@ -386,7 +403,12 @@ def main():
     print(f"Training configuration:")
     print(f"  - Model: {args.model_name}")
     print(f"  - Dataset: {args.dataset_name}")
-    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Train batch size: {args.batch_size}")
+    print(f"  - Eval batch size: {args.eval_batch_size}")
+    print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
+    print(f"  - Max eval samples: {args.max_eval_samples}")
+    print(f"  - Max sequence length: {args.max_seq_length}")
     
     # Setup wandb
     wandb_run = setup_wandb(args)

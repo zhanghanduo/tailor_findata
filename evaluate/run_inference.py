@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument("--test_data", type=str, required=True, help="Path to the test data (JSON file or processed dataset)")
     parser.add_argument("--output_dir", type=str, default="predictions", help="Directory to save predictions")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
-    parser.add_argument("--max_length", type=int, default=8192, help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=4096, help="Maximum sequence length")
     parser.add_argument("--max_new_tokens", type=int, default=512, help="Maximum number of new tokens to generate")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run inference on")
     parser.add_argument("--load_in_4bit", action="store_true", help="Whether to load in 4-bit quantization")
