@@ -70,6 +70,11 @@ def prepare_test_data(test_data_path):
         # Create a dataset from the examples
         from datasets import Dataset
         test_dataset = Dataset.from_list(test_examples)
+        
+        # Debug: Print dataset info
+        print(f"Created dataset with {len(test_dataset)} examples")
+        print(f"Dataset features: {test_dataset.features}")
+        print(f"First example: {test_dataset[0] if len(test_dataset) > 0 else 'No examples'}")
     
     # Extract example IDs
     example_ids = [example["id"] for example in test_dataset] if "id" in test_dataset.column_names else [f"example_{i}" for i in range(len(test_dataset))]
@@ -92,58 +97,58 @@ def run_inference(model, tokenizer, test_dataset, args):
     """
     predictions = []
     
-    # Create dataloader
-    for i in tqdm(range(0, len(test_dataset), args.batch_size), desc="Running inference"):
-        batch = test_dataset[i:i+args.batch_size]
+    # Debug: Print dataset info
+    print(f"Dataset type: {type(test_dataset)}")
+    print(f"Dataset columns: {test_dataset.column_names if hasattr(test_dataset, 'column_names') else 'No column_names attribute'}")
+    print(f"Dataset length: {len(test_dataset)}")
+    
+    # Process examples one by one to avoid batch processing issues
+    for i in tqdm(range(len(test_dataset)), desc="Running inference"):
+        # Get example
+        example = test_dataset[i]
         
-        # Prepare inputs
-        if "conversations" in test_dataset.column_names:
-            # Dataset is already in the right format
-            inputs = tokenizer(
-                [example["text"] for example in batch], 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=args.max_length
-            ).to(args.device)
-        else:
-            # Format inputs for inference
-            prompts = []
-            for example in batch:
-                # Check if example is a dictionary or a dataset item
-                if isinstance(example, dict):
-                    context = example.get("context", "")
-                    question = example.get("question", "")
-                else:
-                    # Access as dataset item
-                    context = example["context"] if "context" in test_dataset.column_names else ""
-                    question = example["question"] if "question" in test_dataset.column_names else ""
+        # Debug info
+        print(f"Processing example {i}, type: {type(example)}")
+        
+        # Extract context and question
+        try:
+            if isinstance(example, dict):
+                context = example.get("context", "")
+                question = example.get("question", "")
+            else:
+                # Try to access as dataset item
+                context = test_dataset[i]["context"] if "context" in test_dataset.column_names else ""
+                question = test_dataset[i]["question"] if "question" in test_dataset.column_names else ""
                 
-                prompt = f"I'm looking at some financial data. Here's the context:\n\n{context}\n\n{question}"
-                prompts.append(prompt)
+            # Create prompt
+            prompt = f"I'm looking at some financial data. Here's the context:\n\n{context}\n\n{question}"
             
+            # Tokenize
             inputs = tokenizer(
-                prompts, 
-                return_tensors="pt", 
-                padding=True, 
+                prompt,
+                return_tensors="pt",
+                padding=True,
                 truncation=True,
                 max_length=args.max_length
             ).to(args.device)
-        
-        # Generate outputs
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        # Decode outputs
-        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        
-        # Add to predictions
-        predictions.extend(decoded_outputs)
+            
+            # Generate
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            
+            # Decode
+            decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            predictions.append(decoded_output)
+            
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+            # Add empty prediction
+            predictions.append("")
     
     return predictions
 
