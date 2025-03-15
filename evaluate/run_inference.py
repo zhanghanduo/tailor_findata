@@ -110,8 +110,14 @@ def run_inference(model, tokenizer, test_dataset, args):
             # Format inputs for inference
             prompts = []
             for example in batch:
-                context = example.get("context", "")
-                question = example.get("question", "")
+                # Check if example is a dictionary or a dataset item
+                if isinstance(example, dict):
+                    context = example.get("context", "")
+                    question = example.get("question", "")
+                else:
+                    # Access as dataset item
+                    context = example["context"] if "context" in test_dataset.column_names else ""
+                    question = example["question"] if "question" in test_dataset.column_names else ""
                 
                 prompt = f"I'm looking at some financial data. Here's the context:\n\n{context}\n\n{question}"
                 prompts.append(prompt)
