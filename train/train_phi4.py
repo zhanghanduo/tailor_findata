@@ -3,6 +3,7 @@ import argparse
 import wandb
 import re
 import numpy as np
+import torch
 from tqdm import tqdm
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import get_chat_template, standardize_sharegpt, train_on_responses_only
@@ -43,6 +44,9 @@ def parse_args():
     parser.add_argument("--eval_split_percentage", type=int, default=4, help="Percentage of data to use for evaluation")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Maximum number of samples to use for evaluation")
+    parser.add_argument("--train_device", type=str, default="cuda:0", help="Device to use for training")
+    parser.add_argument("--eval_device", type=str, default="cuda:1", help="Device to use for evaluation")
+    parser.add_argument("--separate_eval_gpu", action="store_true", default=False, help="Whether to use a separate GPU for evaluation")
     args = parser.parse_args()
     
     # Ensure max_steps has a valid value
@@ -70,6 +74,9 @@ def setup_wandb(args):
         "num_train_epochs": args.num_train_epochs,
         "gradient_checkpointing": args.gradient_checkpointing,
         "max_eval_samples": args.max_eval_samples,
+        "train_device": args.train_device,
+        "eval_device": args.eval_device if args.separate_eval_gpu else None,
+        "separate_eval_gpu": args.separate_eval_gpu,
     }
     
     run_name = args.wandb_run_name or f"phi4-lora-r{args.lora_r}-bs{args.batch_size*args.gradient_accumulation_steps}"
@@ -77,7 +84,7 @@ def setup_wandb(args):
     return wandb.run
 
 
-def load_model_and_tokenizer(args):
+def load_model_and_tokenizer(args, device=None):
     """Load the base model and tokenizer."""
     print(f"Loading model: {args.model_name}")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -85,6 +92,7 @@ def load_model_and_tokenizer(args):
         cache_dir=args.cache_dir,
         max_seq_length=args.max_seq_length,
         load_in_4bit=args.load_in_4bit,
+        device_map=device if device else "auto",  # Specify device if provided
     )
     
     # Apply LoRA
@@ -162,6 +170,9 @@ def prepare_dataset(tokenizer, args):
 
 def get_compute_metrics_fn(tokenizer):
     """Create a compute_metrics function that has access to the tokenizer."""
+    # Get the vocabulary size for clipping
+    vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 32000  # Default fallback
+    
     def compute_metrics(eval_preds):
         """Compute metrics for evaluation."""
         preds, labels = eval_preds
@@ -172,6 +183,7 @@ def get_compute_metrics_fn(tokenizer):
         print(f"Predictions shape: {preds.shape if hasattr(preds, 'shape') else 'No shape attribute'}")
         print(f"Labels type: {type(labels)}")
         print(f"Labels shape: {labels.shape if hasattr(labels, 'shape') else 'No shape attribute'}")
+        print(f"Tokenizer vocabulary size: {vocab_size}")
         
         if len(preds) > 0:
             print(f"First prediction type: {type(preds[0])}")
@@ -196,6 +208,38 @@ def get_compute_metrics_fn(tokenizer):
         
         print(f"Processing {num_samples} samples with batch size {batch_size}")
         
+        # Helper function to safely convert tokens to integers
+        def safe_int_conversion(token):
+            try:
+                # Check if it's a valid integer within Python's int range
+                if isinstance(token, (int, np.integer)):
+                    # For numpy integers, convert to Python int
+                    int_val = int(token)
+                    # Clip to valid vocabulary range if needed
+                    if int_val >= vocab_size:
+                        print(f"  - Clipping token {int_val} to vocab size {vocab_size-1}")
+                        return vocab_size - 1
+                    elif int_val < 0:
+                        print(f"  - Clipping negative token {int_val} to 0")
+                        return 0
+                    return int_val
+                elif isinstance(token, float) and token.is_integer():
+                    # For floats that are integers
+                    int_val = int(token)
+                    # Clip to valid vocabulary range if needed
+                    if int_val >= vocab_size:
+                        print(f"  - Clipping token {int_val} to vocab size {vocab_size-1}")
+                        return vocab_size - 1
+                    elif int_val < 0:
+                        print(f"  - Clipping negative token {int_val} to 0")
+                        return 0
+                    return int_val
+                return None
+            except (OverflowError, ValueError) as e:
+                # If conversion fails due to value being too large
+                print(f"  - Conversion error for token {token} (type: {type(token)}): {e}")
+                return None
+        
         try:
             # Safer approach: process one sample at a time
             for i in range(num_samples):
@@ -204,9 +248,41 @@ def get_compute_metrics_fn(tokenizer):
                 # Process prediction
                 try:
                     pred = preds[i].tolist() if hasattr(preds[i], 'tolist') else preds[i]
-                    # Filter out any non-integer values that might remain
-                    pred = [int(token) for token in pred if isinstance(token, (int, np.integer)) or (isinstance(token, float) and token.is_integer())]
-                    decoded_pred = tokenizer.decode(pred, skip_special_tokens=True)
+                    
+                    # Debug: Print some information about the prediction array
+                    if i < 2 or i >= num_samples - 2:  # Only for first 2 and last 2 samples
+                        print(f"\nSample {i} prediction info:")
+                        print(f"  - Type: {type(pred)}")
+                        print(f"  - Length: {len(pred) if hasattr(pred, '__len__') else 'N/A'}")
+                        print(f"  - First few values: {pred[:5] if hasattr(pred, '__getitem__') else 'N/A'}")
+                        print(f"  - Min value: {np.min(pred) if isinstance(pred, np.ndarray) else 'N/A'}")
+                        print(f"  - Max value: {np.max(pred) if isinstance(pred, np.ndarray) else 'N/A'}")
+                    
+                    # Filter out any non-integer values or values that are too large
+                    valid_tokens = []
+                    invalid_count = 0
+                    for token in pred:
+                        safe_token = safe_int_conversion(token)
+                        if safe_token is not None:
+                            valid_tokens.append(safe_token)
+                        else:
+                            invalid_count += 1
+                    
+                    if invalid_count > 0:
+                        print(f"\nSample {i}: Filtered out {invalid_count} invalid tokens")
+                    
+                    try:
+                        # Add a check for empty token list
+                        if not valid_tokens:
+                            print(f"\nSample {i}: No valid tokens to decode")
+                            decoded_pred = ""
+                        else:
+                            decoded_pred = tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                    except Exception as e:
+                        print(f"\nError in tokenizer.decode for prediction {i}: {e}")
+                        print(f"Valid tokens: {valid_tokens[:10]}{'...' if len(valid_tokens) > 10 else ''}")
+                        decoded_pred = ""
+                    
                     pred_str.append(decoded_pred)
                 except Exception as e:
                     print(f"\nError decoding prediction {i}: {e}")
@@ -217,9 +293,31 @@ def get_compute_metrics_fn(tokenizer):
                 # Process label
                 try:
                     label = labels[i].tolist() if hasattr(labels[i], 'tolist') else labels[i]
-                    # Filter out any non-integer values
-                    label = [int(token) for token in label if isinstance(token, (int, np.integer)) or (isinstance(token, float) and token.is_integer())]
-                    decoded_label = tokenizer.decode(label, skip_special_tokens=True)
+                    # Filter out any non-integer values or values that are too large
+                    valid_tokens = []
+                    invalid_count = 0
+                    for token in label:
+                        safe_token = safe_int_conversion(token)
+                        if safe_token is not None:
+                            valid_tokens.append(safe_token)
+                        else:
+                            invalid_count += 1
+                    
+                    if invalid_count > 0:
+                        print(f"\nSample {i} (label): Filtered out {invalid_count} invalid tokens")
+                    
+                    try:
+                        # Add a check for empty token list
+                        if not valid_tokens:
+                            print(f"\nSample {i} (label): No valid tokens to decode")
+                            decoded_label = ""
+                        else:
+                            decoded_label = tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                    except Exception as e:
+                        print(f"\nError in tokenizer.decode for label {i}: {e}")
+                        print(f"Valid tokens: {valid_tokens[:10]}{'...' if len(valid_tokens) > 10 else ''}")
+                        decoded_label = ""
+                    
                     label_str.append(decoded_label)
                 except Exception as e:
                     print(f"\nError decoding label {i}: {e}")
@@ -228,6 +326,9 @@ def get_compute_metrics_fn(tokenizer):
                     label_str.append("")
             
             print("\nFinished decoding all samples")
+            print(f"Total samples processed: {num_samples}")
+            print(f"Successfully decoded predictions: {len([p for p in pred_str if p])}")
+            print(f"Successfully decoded labels: {len([l for l in label_str if l])}")
             
             # Extract program tokens and answers
             def extract_program_tokens(text):
@@ -422,10 +523,39 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     return trainer
 
 
-def train_model(trainer):
+def train_model(trainer, model, args):
     """Train the model and return training stats."""
     print("Starting training...")
-    trainer_stats = trainer.train()
+    
+    # If using separate GPU for evaluation, modify the trainer's evaluation strategy
+    if args.separate_eval_gpu:
+        # Disable automatic evaluation during training
+        trainer.args.evaluation_strategy = "no"
+        
+        # Custom training loop with manual evaluation on separate GPU
+        total_steps = trainer.args.max_steps if trainer.args.max_steps > 0 else \
+                     (len(trainer.train_dataset) // (trainer.args.per_device_train_batch_size * trainer.args.gradient_accumulation_steps)) * trainer.args.num_train_epochs
+        
+        eval_steps = args.eval_steps
+        current_step = 0
+        
+        # Start training
+        while current_step < total_steps:
+            # Train for eval_steps
+            next_step = min(current_step + eval_steps, total_steps)
+            trainer.args.max_steps = next_step
+            partial_train_stats = trainer.train(resume_from_checkpoint=current_step > 0)
+            current_step = next_step
+            
+            # Evaluate on separate GPU
+            if trainer.is_world_process_zero() and args.eval_split_percentage > 0:
+                print(f"Step {current_step}/{total_steps}: Running evaluation on separate GPU")
+                evaluate_on_separate_gpu(trainer, model, args)
+        
+        trainer_stats = partial_train_stats
+    else:
+        # Standard training with automatic evaluation
+        trainer_stats = trainer.train()
     
     # Log final metrics
     if wandb.run:
@@ -510,6 +640,33 @@ def test_model(model_path, args):
     return results
 
 
+def evaluate_on_separate_gpu(trainer, model, args):
+    """Evaluate the model on a separate GPU to avoid CUDA OOM issues."""
+    print(f"Moving model to evaluation device: {args.eval_device}")
+    
+    # Store the original device
+    original_device = next(model.parameters()).device
+    
+    # Move model to evaluation device
+    with torch.no_grad():  # Prevent gradient storage to save memory
+        model.to(args.eval_device)
+        
+        # Run evaluation
+        print("Starting evaluation on separate GPU...")
+        evaluation_results = trainer.evaluate()
+        
+        # Log evaluation results
+        if wandb.run:
+            for key, value in evaluation_results.items():
+                wandb.log({f"eval/{key}": value})
+        
+        # Move model back to original device
+        print(f"Moving model back to training device: {original_device}")
+        model.to(original_device)
+    
+    return evaluation_results
+
+
 def main():
     """Main function to run the training pipeline."""
     # Parse arguments
@@ -518,6 +675,15 @@ def main():
     # Ensure max_steps is properly set
     if args.max_steps is None or args.max_steps <= 0:
         args.max_steps = -1
+    
+    # Check if separate GPU evaluation is possible
+    if args.separate_eval_gpu:
+        if not torch.cuda.is_available():
+            print("Warning: CUDA not available. Disabling separate GPU evaluation.")
+            args.separate_eval_gpu = False
+        elif torch.cuda.device_count() < 2:
+            print(f"Warning: Only {torch.cuda.device_count()} GPU available. Disabling separate GPU evaluation.")
+            args.separate_eval_gpu = False
     
     print(f"Training configuration:")
     print(f"  - Model: {args.model_name}")
@@ -528,12 +694,15 @@ def main():
     print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
     print(f"  - Max eval samples: {args.max_eval_samples}")
     print(f"  - Max sequence length: {args.max_seq_length}")
+    print(f"  - Training device: {args.train_device}")
+    if args.separate_eval_gpu:
+        print(f"  - Evaluation device: {args.eval_device}")
     
     # Setup wandb
     wandb_run = setup_wandb(args)
     
-    # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(args)
+    # Load model and tokenizer on the training device
+    model, tokenizer = load_model_and_tokenizer(args, device=args.train_device if args.separate_eval_gpu else None)
     
     # Prepare dataset
     train_dataset, eval_dataset = prepare_dataset(tokenizer, args)
@@ -542,7 +711,7 @@ def main():
     trainer = setup_trainer(model, tokenizer, train_dataset, eval_dataset, args)
     
     # Train model
-    trainer_stats = train_model(trainer)
+    trainer_stats = train_model(trainer, model, args)
     
     # Save model
     model_path = save_model(model, tokenizer, args)
