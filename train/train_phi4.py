@@ -17,6 +17,38 @@ from transformers import (
 import torch
 
 
+system_prompt = """Your role is to solve financial questions by generating both the program tokens that represent the calculation and the final answer. 
+For each question, ONLY provide:
+1. The program tokens that represent the calculation using <begin_of_program> and <end_of_program> tags
+2. The final answer using <begin_of_answer> and <end_of_answer> tags
+
+The program tokens should follow this EXACT format:
+<begin_of_program>
+operation_name( number1 number2 ) EOF
+<end_of_program>
+
+<begin_of_answer>
+numerical_result
+<end_of_answer>
+
+Examples of operations:
+- For addition: add( number1 number2 ) EOF
+- For subtraction: subtract( number1 number2 ) EOF
+- For multiplication: multiply( number1 number2 ) EOF
+- For division: divide( number1 number2 ) EOF
+
+IMPORTANT: 
+- Always include the # symbol before reference numbers (e.g., #0, #1)
+- Never omit any part of the format
+- Always end program tokens with the EOF token
+- The answer should be ONLY the numerical result without any additional text, units, or explanations
+- DO NOT include any financial context, table data, or explanations in your response
+- DO NOT include any text outside of the specified tags
+
+Your response should ONLY contain the program tokens and answer within their respective tags.
+"""
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train Phi-4 with LoRA")
@@ -26,8 +58,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save model checkpoints")
     parser.add_argument("--max_seq_length", type=int, default=4096, help="Maximum sequence length")
     parser.add_argument("--load_in_4bit", action="store_true", default=True, help="Whether to load in 4-bit quantization")
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=8, help="LoRA alpha")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
     parser.add_argument("--eval_batch_size", type=int, default=1, help="Evaluation batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of gradient accumulation steps")
@@ -152,7 +184,7 @@ def prepare_dataset(tokenizer, args):
                 convo, 
                 tokenize=False, 
                 add_generation_prompt=False,
-                system_message=sys_prompt  # Pass system prompt separately
+                system_message=system_prompt
             )
             texts.append(formatted_text)
         return {"text": texts}

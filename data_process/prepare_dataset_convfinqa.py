@@ -97,6 +97,35 @@ def program_tokens_to_string(tokens):
     return " ".join(tokens)
 
 
+def clean_model_output(model_output):
+    """
+    Clean up model output to extract only the program and answer tags.
+    
+    Args:
+        model_output (str): Raw model output
+        
+    Returns:
+        str: Cleaned output with only program and answer tags
+    """
+    # Extract program section
+    program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
+    program_match = re.search(program_pattern, model_output, re.DOTALL)
+    program_content = program_match.group(1).strip() if program_match else "EOF"
+    
+    # Extract answer section
+    answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
+    answer_match = re.search(answer_pattern, model_output, re.DOTALL)
+    answer_content = answer_match.group(1).strip() if answer_match else "N/A"
+    
+    # Format clean output
+    clean_output = (
+        f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+        f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+    )
+    
+    return clean_output
+
+
 def get_convfinqa_dataset(json_file):
     """
     Convert ConvFinQA dataset to a format that includes both program tokens and answers.
@@ -106,25 +135,34 @@ def get_convfinqa_dataset(json_file):
     
     # System prompt for structured thinking and program generation
     system_prompt = """Your role is to solve financial questions by generating both the program tokens that represent the calculation and the final answer. 
-For each question, provide:
+For each question, ONLY provide:
 1. The program tokens that represent the calculation using <begin_of_program> and <end_of_program> tags
 2. The final answer using <begin_of_answer> and <end_of_answer> tags
 
 The program tokens should follow this EXACT format:
-- For addition: ["add(", "number1", "number2", ")", "EOF"]
-- For subtraction: ["subtract(", "number1", "number2", ")", "EOF"]
-- For multiplication: ["multiply(", "number1", "number2", ")", "EOF"]
-- For division: ["divide(", "number1", "number2", ")", "EOF"]
+<begin_of_program>
+operation_name( number1 number2 ) EOF
+<end_of_program>
+
+<begin_of_answer>
+numerical_result
+<end_of_answer>
+
+Examples of operations:
+- For addition: add( number1 number2 ) EOF
+- For subtraction: subtract( number1 number2 ) EOF
+- For multiplication: multiply( number1 number2 ) EOF
+- For division: divide( number1 number2 ) EOF
 
 IMPORTANT: 
 - Always include the # symbol before reference numbers (e.g., #0, #1)
 - Never omit any part of the format
-- Always end program tokens with the EOF token.
-- The answer should be ONLY the numerical result without any additional text, units, or explanations.
-    For example:
-    - Correct: <begin_of_answer>42.5</end_of_answer>
-    - Incorrect: <begin_of_answer>The answer is 42.5</end_of_answer>
-    - Incorrect: <begin_of_answer>$42.5</end_of_answer>
+- Always end program tokens with the EOF token
+- The answer should be ONLY the numerical result without any additional text, units, or explanations
+- DO NOT include any financial context, table data, or explanations in your response
+- DO NOT include any text outside of the specified tags
+
+Your response should ONLY contain the program tokens and answer within their respective tags.
 """
     
     samples = json.load(open(json_file))

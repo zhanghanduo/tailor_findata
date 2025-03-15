@@ -11,9 +11,9 @@ python train/train_phi4.py \
   --gradient_checkpointing \
   --max_eval_samples 50 \
   --eval_steps 5 \
-  --save_steps 40 \
+  --save_steps 20 \
   --max_seq_length 4096 \
   --learning_rate 2e-4 \
-  --num_train_epochs 3 \
+  --num_train_epochs 2 \
   --wandb_project "phi4-finqa-sft" \
   --wandb_run_name "phi4-finqa-memory-optimized" \
