@@ -177,104 +177,174 @@ def get_compute_metrics_fn(tokenizer):
             print(f"First prediction type: {type(preds[0])}")
             print(f"First prediction sample: {preds[0][:10] if len(preds[0]) > 10 else preds[0]}")
         
+        # Convert logits to token IDs if needed
+        if len(preds.shape) == 3:  # Shape: (batch_size, seq_len, vocab_size)
+            print("Detected logits format. Converting to token IDs...")
+            # Get the token ID with the highest probability for each position
+            preds = np.argmax(preds, axis=-1)
+            print(f"Converted predictions shape: {preds.shape}")
+            print(f"First converted prediction: {preds[0][:10]}")
+        
         # Replace -100 with pad token id
         labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         
         # Process in smaller batches to avoid OOM
-        batch_size = 16
+        batch_size = 8  # Reduced batch size
         num_samples = len(preds)
         pred_str = []
         label_str = []
         
-        for i in range(0, num_samples, batch_size):
-            end_idx = min(i + batch_size, num_samples)
-            # Convert numpy arrays to lists of integers for batch_decode
-            pred_batch = [pred.tolist() for pred in preds[i:end_idx]]
-            label_batch = [label.tolist() for label in labels[i:end_idx]]
-            
-            # Decode each sequence individually to avoid type errors
-            for pred in pred_batch:
+        print(f"Processing {num_samples} samples with batch size {batch_size}")
+        
+        try:
+            # Safer approach: process one sample at a time
+            for i in range(num_samples):
+                print(f"Processing sample {i+1}/{num_samples}...", end="\r")
+                
+                # Process prediction
                 try:
-                    decoded = tokenizer.decode(pred, skip_special_tokens=True)
-                    pred_str.append(decoded)
+                    pred = preds[i].tolist() if hasattr(preds[i], 'tolist') else preds[i]
+                    # Filter out any non-integer values that might remain
+                    pred = [int(token) for token in pred if isinstance(token, (int, np.integer)) or (isinstance(token, float) and token.is_integer())]
+                    decoded_pred = tokenizer.decode(pred, skip_special_tokens=True)
+                    pred_str.append(decoded_pred)
                 except Exception as e:
-                    print(f"Error decoding prediction: {e}")
-                    print(f"Prediction type: {type(pred)}, content: {pred[:10]}...")
+                    print(f"\nError decoding prediction {i}: {e}")
+                    print(f"Prediction type: {type(preds[i])}")
+                    # Add empty string as fallback
                     pred_str.append("")
-            
-            for label in label_batch:
+                
+                # Process label
                 try:
-                    decoded = tokenizer.decode(label, skip_special_tokens=True)
-                    label_str.append(decoded)
+                    label = labels[i].tolist() if hasattr(labels[i], 'tolist') else labels[i]
+                    # Filter out any non-integer values
+                    label = [int(token) for token in label if isinstance(token, (int, np.integer)) or (isinstance(token, float) and token.is_integer())]
+                    decoded_label = tokenizer.decode(label, skip_special_tokens=True)
+                    label_str.append(decoded_label)
                 except Exception as e:
-                    print(f"Error decoding label: {e}")
-                    print(f"Label type: {type(label)}, content: {label[:10]}...")
+                    print(f"\nError decoding label {i}: {e}")
+                    print(f"Label type: {type(labels[i])}")
+                    # Add empty string as fallback
                     label_str.append("")
-        
-        # Extract program tokens and answers
-        def extract_program_tokens(text):
-            program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
-            match = re.search(program_pattern, text, re.DOTALL)
-            if match:
-                program_text = match.group(1).strip()
-                return program_text.split()
-            return ["EOF"]
-        
-        def extract_answer(text):
-            answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
-            match = re.search(answer_pattern, text, re.DOTALL)
-            if match:
-                solution = match.group(1).strip()
-                # Normalize numerical values
-                solution = solution.replace('%', '')
+            
+            print("\nFinished decoding all samples")
+            
+            # Extract program tokens and answers
+            def extract_program_tokens(text):
                 try:
-                    # Convert to float for numerical comparison
-                    return float(solution)
-                except:
-                    # If not a number, return as is
-                    return solution
-            return text.strip()
-        
-        # Extract programs and answers
-        pred_programs = [extract_program_tokens(p) for p in pred_str]
-        label_programs = [extract_program_tokens(l) for l in label_str]
-        
-        pred_answers = [extract_answer(p) for p in pred_str]
-        label_answers = [extract_answer(l) for l in label_str]
-        
-        # Program token match
-        program_matches = 0
-        for pred_prog, label_prog in zip(pred_programs, label_programs):
-            if pred_prog == label_prog:
-                program_matches += 1
-        
-        # Answer matches (numerical with tolerance or exact)
-        answer_matches = 0
-        tolerance = 0.001  # 0.1% tolerance
-        
-        for pred, label in zip(pred_answers, label_answers):
-            if isinstance(pred, float) and isinstance(label, float):
-                # Numerical comparison with tolerance
-                if abs(pred - label) <= tolerance * max(1, abs(label)):
+                    program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
+                    match = re.search(program_pattern, text, re.DOTALL)
+                    if match:
+                        program_text = match.group(1).strip()
+                        return program_text.split()
+                    return ["EOF"]
+                except Exception as e:
+                    print(f"Error extracting program tokens: {e}")
+                    return ["ERROR"]
+            
+            def extract_answer(text):
+                try:
+                    answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+                    match = re.search(answer_pattern, text, re.DOTALL)
+                    if match:
+                        solution = match.group(1).strip()
+                        # Normalize numerical values
+                        solution = solution.replace('%', '')
+                        try:
+                            # Convert to float for numerical comparison
+                            return float(solution)
+                        except:
+                            # If not a number, return as is
+                            return solution
+                    return text.strip()
+                except Exception as e:
+                    print(f"Error extracting answer: {e}")
+                    return ""
+            
+            print("Extracting programs and answers...")
+            
+            # Extract programs and answers with error handling
+            pred_programs = []
+            label_programs = []
+            pred_answers = []
+            label_answers = []
+            
+            for p in pred_str:
+                try:
+                    pred_programs.append(extract_program_tokens(p))
+                except Exception as e:
+                    print(f"Error processing prediction program: {e}")
+                    pred_programs.append(["ERROR"])
+                    
+                try:
+                    pred_answers.append(extract_answer(p))
+                except Exception as e:
+                    print(f"Error processing prediction answer: {e}")
+                    pred_answers.append("")
+            
+            for l in label_str:
+                try:
+                    label_programs.append(extract_program_tokens(l))
+                except Exception as e:
+                    print(f"Error processing label program: {e}")
+                    label_programs.append(["ERROR"])
+                    
+                try:
+                    label_answers.append(extract_answer(l))
+                except Exception as e:
+                    print(f"Error processing label answer: {e}")
+                    label_answers.append("")
+            
+            print("Calculating metrics...")
+            
+            # Program token match
+            program_matches = 0
+            for pred_prog, label_prog in zip(pred_programs, label_programs):
+                if pred_prog == label_prog:
+                    program_matches += 1
+            
+            # Answer matches (numerical with tolerance or exact)
+            answer_matches = 0
+            tolerance = 0.001  # 0.1% tolerance
+            
+            for pred, label in zip(pred_answers, label_answers):
+                if isinstance(pred, float) and isinstance(label, float):
+                    # Numerical comparison with tolerance
+                    if abs(pred - label) <= tolerance * max(1, abs(label)):
+                        answer_matches += 1
+                elif pred == label:
                     answer_matches += 1
-            elif pred == label:
-                answer_matches += 1
-        
-        # Calculate metrics
-        program_match_percentage = program_matches / max(1, len(pred_str)) * 100
-        answer_match_percentage = answer_matches / max(1, len(pred_str)) * 100
-        
-        # Log examples to wandb
-        if wandb.run:
-            examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", "Pred Answer", "Label Answer"])
-            for p, l, pp, lp, pa, la in list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:5]:
-                examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la))
-            wandb.log({"eval_examples": examples_table})
-        
-        return {
-            "program_match": program_match_percentage,
-            "answer_match": answer_match_percentage,
-        }
+            
+            # Calculate metrics
+            program_match_percentage = program_matches / max(1, len(pred_str)) * 100
+            answer_match_percentage = answer_matches / max(1, len(pred_str)) * 100
+            
+            print(f"Program match: {program_match_percentage:.2f}%, Answer match: {answer_match_percentage:.2f}%")
+            
+            # Log examples to wandb
+            if wandb.run:
+                try:
+                    examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", "Pred Answer", "Label Answer"])
+                    for p, l, pp, lp, pa, la in list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:5]:
+                        examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la))
+                    wandb.log({"eval_examples": examples_table})
+                except Exception as e:
+                    print(f"Error logging to wandb: {e}")
+            
+            return {
+                "program_match": program_match_percentage,
+                "answer_match": answer_match_percentage,
+            }
+            
+        except Exception as e:
+            print(f"Critical error in compute_metrics: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return default metrics to avoid breaking the training loop
+            return {
+                "program_match": 0.0,
+                "answer_match": 0.0,
+            }
     
     return compute_metrics
 
@@ -283,6 +353,17 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     """Set up the SFT trainer."""
     # Ensure max_steps is an integer
     max_steps = args.max_steps if args.max_steps > 0 else -1
+    
+    # Define a function to preprocess logits for metrics calculation
+    def preprocess_logits_for_metrics(logits, labels):
+        """Convert logits to predictions for metrics calculation."""
+        # If logits is a tuple, take the first element (which should be the main logits)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        
+        # Get the predicted token IDs
+        pred_ids = logits.argmax(dim=-1)
+        return pred_ids
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -312,6 +393,8 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         # Add memory optimization options
         deepspeed=None,  # Let the trainer handle memory optimization
         ddp_find_unused_parameters=False,
+        # Ensure we get predictions, not just loss
+        prediction_loss_only=False,
     )
     
     trainer = SFTTrainer(
@@ -326,6 +409,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         packing=False,
         args=training_args,
         compute_metrics=get_compute_metrics_fn(tokenizer) if eval_dataset else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset else None,
     )
     
     # Configure to train only on assistant responses
