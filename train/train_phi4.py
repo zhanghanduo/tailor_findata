@@ -649,11 +649,15 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         ddp_find_unused_parameters=False,
         # Ensure we get predictions, not just loss
         prediction_loss_only=False,
-        # Add evaluation patience to avoid stopping on temporary dips
-        early_stopping_patience=3 if eval_dataset else None,
-        # Log more detailed metrics
-        include_inputs_for_metrics=True,
     )
+    
+    # Create callbacks list
+    callbacks = []
+    
+    # Add early stopping callback if using evaluation
+    if eval_dataset:
+        from transformers import EarlyStoppingCallback
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
     
     trainer = SFTTrainer(
         model=model,
@@ -668,6 +672,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         args=training_args,
         compute_metrics=get_compute_metrics_fn(tokenizer) if eval_dataset else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset else None,
+        callbacks=callbacks,
     )
     
     # Configure to train only on assistant responses

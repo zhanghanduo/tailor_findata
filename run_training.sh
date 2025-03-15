@@ -10,7 +10,7 @@ python train/train_phi4.py \
   --gradient_accumulation_steps 4 \
   --gradient_checkpointing \
   --max_eval_samples 50 \
-  --eval_steps 20 \
+  --eval_steps 5 \
   --save_steps 40 \
   --max_seq_length 4096 \
   --learning_rate 2e-4 \
