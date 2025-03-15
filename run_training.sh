@@ -17,4 +17,3 @@ python train/train_phi4.py \
   --num_train_epochs 3 \
   --wandb_project "phi4-finqa-sft" \
   --wandb_run_name "phi4-finqa-memory-optimized" \
-  --force_dataset_download

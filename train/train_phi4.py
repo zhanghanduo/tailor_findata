@@ -728,8 +728,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     trainer = train_on_responses_only(
         trainer,
         instruction_part="<|im_start|>human<|im_sep|>",
-        response_part="<|im_start|>assistant<|im_sep|>",
-        response_template="<begin_of_program>\n{program}\n<end_of_program>\n\n<begin_of_answer>\n{answer}\n<end_of_answer>"
+        response_part="<|im_start|>assistant<|im_sep|>"
     )
     
     return trainer
