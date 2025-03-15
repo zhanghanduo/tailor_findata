@@ -78,6 +78,34 @@ def setup_wandb(args):
     return wandb.run
 
 
+def validate_format(text):
+    """Validate that the text follows the expected format."""
+    # Check for program tokens format
+    program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
+    program_match = re.search(program_pattern, text, re.DOTALL)
+    
+    # Check for answer format
+    answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+    answer_match = re.search(answer_pattern, text, re.DOTALL)
+    
+    # Basic validation
+    is_valid = program_match is not None and answer_match is not None
+    
+    # Check for common formatting issues in program tokens
+    if program_match:
+        program_text = program_match.group(1).strip()
+        tokens = program_text.split()
+        
+        # Check for reference numbers without #
+        for i, token in enumerate(tokens):
+            if i > 0 and token.isdigit() and tokens[i-1].endswith("("):
+                # This might be a reference number without #
+                is_valid = False
+                break
+    
+    return is_valid
+
+
 def load_model_and_tokenizer(args):
     """Load the base model and tokenizer."""
     print(f"Loading model: {args.model_name}")
@@ -113,12 +141,18 @@ def prepare_dataset(tokenizer, args):
     """Load and prepare the dataset for training and evaluation."""
     def formatting_prompts_func(examples):
         convos = examples["conversations"]
-        texts = [
-            tokenizer.apply_chat_template(
-                convo, tokenize=False, add_generation_prompt=False
+        system_prompts = examples["system"]
+
+        texts = []
+        for convo, sys_prompt in zip(convos, system_prompts):
+            # Apply the chat template with the system prompt as a separate parameter
+            formatted_text = tokenizer.apply_chat_template(
+                convo, 
+                tokenize=False, 
+                add_generation_prompt=False,
+                system_message=sys_prompt  # Pass system prompt separately
             )
-            for convo in convos
-        ]
+            texts.append(formatted_text)
         return {"text": texts}
     
     # Load dataset
@@ -162,41 +196,38 @@ def prepare_dataset(tokenizer, args):
 
 
 def analyze_predictions(pred_str, label_str, pred_answers, label_answers, step=None):
-    """Analyze prediction patterns and log detailed metrics to wandb."""
-    # Count different types of predictions
+    """Analyze prediction patterns to understand model behavior."""
     analysis = {
-        "empty_predictions": 0,
-        "empty_labels": 0,
-        "format_matches": 0,
-        "answer_format_errors": 0,
+        "total_samples": len(pred_str),
+        "program_token_matches": 0,
         "numerical_answers": 0,
         "string_answers": 0,
         "answer_type_mismatches": 0,
+        "empty_predictions": 0,
+        "exact_matches": 0,
+        "format_valid": 0,
     }
     
-    # Check for answer format patterns
-    answer_begin_pattern = r'<begin_of_answer>'
-    answer_end_pattern = r'<end_of_answer>'
+    # Initialize wandb if not already done
+    if not wandb.run:
+        try:
+            wandb.init(project="finqa_analysis", mode="offline")
+        except:
+            pass
     
     for i, (pred, label, pred_ans, label_ans) in enumerate(zip(pred_str, label_str, pred_answers, label_answers)):
-        # Check for empty predictions/labels
-        if not pred.strip():
+        # Check for empty predictions
+        if not pred or pred.isspace():
             analysis["empty_predictions"] += 1
-        if not label.strip():
-            analysis["empty_labels"] += 1
+            continue
             
-        # Check for format matches
-        pred_has_begin = bool(re.search(answer_begin_pattern, pred))
-        pred_has_end = bool(re.search(answer_end_pattern, pred))
-        label_has_begin = bool(re.search(answer_begin_pattern, label))
-        label_has_end = bool(re.search(answer_end_pattern, label))
-        
-        if (pred_has_begin and pred_has_end) == (label_has_begin and label_has_end):
-            analysis["format_matches"] += 1
-        
-        # Check for answer format errors
-        if (pred_has_begin and not pred_has_end) or (not pred_has_begin and pred_has_end):
-            analysis["answer_format_errors"] += 1
+        # Check for exact matches
+        if pred == label:
+            analysis["exact_matches"] += 1
+
+        # Check format validity
+        if validate_format(pred):
+            analysis["format_valid"] += 1
             
         # Count answer types
         if isinstance(pred_ans, float):
@@ -211,7 +242,8 @@ def analyze_predictions(pred_str, label_str, pred_answers, label_answers, step=N
     
     # Calculate percentages
     total = max(1, len(pred_str))
-    for key in analysis:
+    analysis_keys = list(analysis.keys())  # Create a copy of keys to prevent iteration issues
+    for key in analysis_keys:
         analysis[f"{key}_pct"] = analysis[key] / total * 100
         
     # Log to wandb
@@ -421,19 +453,25 @@ def get_compute_metrics_fn(tokenizer):
                         solution = solution.replace('%', '')
                         solution = solution.replace('$', '')
                         solution = solution.replace(',', '')
+                        
+                        # Try to convert to float for numerical comparison
                         try:
-                            # Convert to float for numerical comparison
-                            return float(solution)
-                        except:
-                            # If not a number, return as is
-                            return solution.lower()  # Normalize case for string comparison
+                            # Check if the solution contains only digits, decimal point, and minus sign
+                            if re.match(r'^-?\d+\.?\d*$', solution):
+                                return float(solution)
+                            else:
+                                # If it contains other characters, it's likely a string answer
+                                return solution.lower()  # Normalize case for string comparison
+                        except ValueError:
+                            # If conversion fails, return as string
+                            return solution.lower()
                     
                     # If standard format not found, try to find numerical answers in the text
                     # Look for patterns like "The answer is X" or "= X"
                     alt_patterns = [
-                        r'(?:answer|result|value)(?:\s+is|\s*[:=])\s*([\d\.\,]+)',
-                        r'(?:=|equals)\s*([\d\.\,]+)',
-                        r'(?:[\$£€])\s*([\d\.\,]+)'
+                        r'(?:answer|result|value)(?:\s+is|\s*[:=])\s*([-\d\.\,]+)',
+                        r'(?:=|equals)\s*([-\d\.\,]+)',
+                        r'(?:[\$£€])\s*([-\d\.\,]+)'
                     ]
                     
                     for pattern in alt_patterns:
@@ -443,14 +481,14 @@ def get_compute_metrics_fn(tokenizer):
                             solution = solution.replace(',', '')
                             try:
                                 return float(solution)
-                            except:
+                            except ValueError:
                                 pass
                     
                     # If no patterns matched, return the whole text as a fallback
                     return text.strip().lower()
                 except Exception as e:
                     print(f"Error extracting answer: {e}")
-                    return text.strip().lower()  # Return the full text as a fallback
+                    return "ERROR"
             
             print("Extracting programs and answers...")
             
@@ -557,7 +595,8 @@ def get_compute_metrics_fn(tokenizer):
             # Log examples to wandb
             if wandb.run:
                 try:
-                    examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", "Pred Answer", "Label Answer", "Answer Match"])
+                    examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", 
+                                                          "Pred Answer", "Label Answer", "Answer Match", "Format Valid"])
                     for i, (p, l, pp, lp, pa, la) in enumerate(list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:10]):
                         # Determine if answers match
                         match = False
@@ -572,7 +611,8 @@ def get_compute_metrics_fn(tokenizer):
                                 similarity = SequenceMatcher(None, pa_norm, la_norm).ratio()
                                 match = similarity > 0.8
                         
-                        examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la), str(match))
+                        format_valid = validate_format(p)
+                        examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la), str(match), str(format_valid))
                     wandb.log({"eval_examples": examples_table})
                 except Exception as e:
                     print(f"Error logging to wandb: {e}")
@@ -680,6 +720,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         trainer,
         instruction_part="<|im_start|>human<|im_sep|>",
         response_part="<|im_start|>assistant<|im_sep|>",
+        response_template="<begin_of_program>\n{program}\n<end_of_program>\n\n<begin_of_answer>\n{answer}\n<end_of_answer>"
     )
     
     return trainer

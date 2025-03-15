@@ -4,6 +4,7 @@ import pandas as pd
 from datasets import load_dataset, Dataset, DatasetDict
 import re
 from bs4 import BeautifulSoup
+import huggingface_hub
 
 
 def format_table_for_llm(html_table):
@@ -109,13 +110,22 @@ For each question, provide:
 1. The program tokens that represent the calculation using <begin_of_program> and <end_of_program> tags
 2. The final answer using <begin_of_answer> and <end_of_answer> tags
 
-The program tokens should follow this format:
+The program tokens should follow this EXACT format:
 - For addition: ["add(", "number1", "number2", ")", "EOF"]
 - For subtraction: ["subtract(", "number1", "number2", ")", "EOF"]
 - For multiplication: ["multiply(", "number1", "number2", ")", "EOF"]
 - For division: ["divide(", "number1", "number2", ")", "EOF"]
 
-Always end with the EOF token."""
+IMPORTANT: 
+- Always include the # symbol before reference numbers (e.g., #0, #1)
+- Never omit any part of the format
+- Always end program tokens with the EOF token.
+- The answer should be ONLY the numerical result without any additional text, units, or explanations.
+    For example:
+    - Correct: <begin_of_answer>42.5</end_of_answer>
+    - Incorrect: <begin_of_answer>The answer is 42.5</end_of_answer>
+    - Incorrect: <begin_of_answer>$42.5</end_of_answer>
+"""
     
     samples = json.load(open(json_file))
     for sample in samples:
@@ -142,9 +152,6 @@ Always end with the EOF token."""
         # Create conversation with proper turns
         conversation = []
         
-        # Add system message
-        conversation.append({"role": "system", "content": system_prompt})
-        
         # Process each turn
         for i in range(len(questions)):
             # First turn includes the financial context
@@ -166,16 +173,32 @@ Always end with the EOF token."""
             
             # Format program tokens as a string
             program_str = program_tokens_to_string(program_tokens)
+            
+            # Get the answer and ensure it's properly formatted
+            answer = answers[i] if i < len(answers) else 'N/A'
+            # Try to convert to float and back to string to ensure numerical format
+            try:
+                # Remove any non-numeric characters except decimal point and minus sign
+                answer_str = str(answer).replace('$', '').replace('%', '').replace(',', '')
+                # If it can be converted to float, use the clean numeric format
+                float_answer = float(answer_str)
+                answer = str(float_answer)
+            except (ValueError, TypeError):
+                # If not convertible to float, use as is
+                pass
                         
             # Format the assistant's response with all components
             assistant_response = (
                 f"<begin_of_program>\n{program_str}\n<end_of_program>\n\n"
-                f"<begin_of_answer>\n{answers[i] if i < len(answers) else 'N/A'}\n<end_of_answer>"
+                f"<begin_of_answer>\n{answer}\n<end_of_answer>"
             )
             
             conversation.append({"role": "assistant", "content": assistant_response})
         
-        conversations.append({"conversations": conversation})
+        conversations.append({
+            "system": system_prompt,
+            "conversations": conversation
+        })
     
     return Dataset.from_list(conversations)
 
@@ -213,4 +236,5 @@ def prepare_convfinqa_datasets(data_dir="data", output_dir="processed_data"):
 
 
 if __name__ == "__main__":
-    prepare_convfinqa_datasets() 
+    dataset_out = prepare_convfinqa_datasets() 
+    # dataset_out.push_to_hub("christlurker/convfinqa_sharegpt_refine")
