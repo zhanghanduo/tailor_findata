@@ -41,7 +41,13 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="phi4-lora-sft", help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
     parser.add_argument("--eval_split_percentage", type=int, default=5, help="Percentage of data to use for evaluation")
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # Ensure max_steps has a valid value
+    if args.max_steps is None:
+        args.max_steps = -1
+        
+    return args
 
 
 def setup_wandb(args):
@@ -57,6 +63,8 @@ def setup_wandb(args):
         "max_seq_length": args.max_seq_length,
         "load_in_4bit": args.load_in_4bit,
         "seed": args.seed,
+        "max_steps": args.max_steps,
+        "num_train_epochs": args.num_train_epochs,
     }
     
     run_name = args.wandb_run_name or f"phi4-lora-r{args.lora_r}-bs{args.batch_size*args.gradient_accumulation_steps}"
@@ -177,13 +185,16 @@ def compute_metrics(eval_preds):
 
 def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     """Set up the SFT trainer."""
+    # Ensure max_steps is an integer
+    max_steps = args.max_steps if args.max_steps > 0 else -1
+    
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         num_train_epochs=args.num_train_epochs,
-        max_steps=args.max_steps if args.max_steps > 0 else None,
+        max_steps=max_steps,  # Use the pre-processed value
         warmup_steps=args.warmup_steps,
         fp16=not is_bfloat16_supported(),
         bf16=is_bfloat16_supported(),
@@ -233,11 +244,19 @@ def train_model(trainer):
     
     # Log final metrics
     if wandb.run:
-        wandb.log({
-            "train/final_loss": trainer_stats.training_loss,
-            "train/epoch": trainer_stats.epoch,
+        metrics = {
             "train/global_step": trainer_stats.global_step,
-        })
+        }
+        
+        # Add training loss if available
+        if hasattr(trainer_stats, 'training_loss') and trainer_stats.training_loss is not None:
+            metrics["train/final_loss"] = trainer_stats.training_loss
+            
+        # Add epoch if available
+        if hasattr(trainer_stats, 'epoch') and trainer_stats.epoch is not None:
+            metrics["train/epoch"] = trainer_stats.epoch
+            
+        wandb.log(metrics)
     
     return trainer_stats
 
@@ -310,6 +329,19 @@ def main():
     """Main function to run the training pipeline."""
     # Parse arguments
     args = parse_args()
+    
+    # Ensure max_steps is properly set
+    if args.max_steps is None or args.max_steps <= 0:
+        args.max_steps = -1
+    
+    print(f"Training configuration:")
+    print(f"  - Model: {args.model_name}")
+    print(f"  - Dataset: {args.dataset_name}")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"  - Learning rate: {args.learning_rate}")
+    print(f"  - Max steps: {args.max_steps}")
+    print(f"  - Num train epochs: {args.num_train_epochs}")
     
     # Setup wandb
     wandb_run = setup_wandb(args)
