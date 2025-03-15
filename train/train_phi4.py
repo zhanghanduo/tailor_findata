@@ -160,88 +160,92 @@ def prepare_dataset(tokenizer, args):
     return train_dataset, eval_dataset
 
 
-def compute_metrics(eval_preds):
-    """Compute metrics for evaluation."""
-    preds, labels = eval_preds
-    
-    # Replace -100 with pad token id
-    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-    
-    # Process in smaller batches to avoid OOM
-    batch_size = 16
-    num_samples = len(preds)
-    pred_str = []
-    label_str = []
-    
-    for i in range(0, num_samples, batch_size):
-        end_idx = min(i + batch_size, num_samples)
-        pred_str.extend(tokenizer.batch_decode(preds[i:end_idx], skip_special_tokens=True))
-        label_str.extend(tokenizer.batch_decode(labels[i:end_idx], skip_special_tokens=True))
-    
-    # Extract program tokens and answers
-    def extract_program_tokens(text):
-        program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
-        match = re.search(program_pattern, text, re.DOTALL)
-        if match:
-            program_text = match.group(1).strip()
-            return program_text.split()
-        return ["EOF"]
-    
-    def extract_answer(text):
-        answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
-        match = re.search(answer_pattern, text, re.DOTALL)
-        if match:
-            solution = match.group(1).strip()
-            # Normalize numerical values
-            solution = solution.replace('%', '')
-            try:
-                # Convert to float for numerical comparison
-                return float(solution)
-            except:
-                # If not a number, return as is
-                return solution
-        return text.strip()
-    
-    # Extract programs and answers
-    pred_programs = [extract_program_tokens(p) for p in pred_str]
-    label_programs = [extract_program_tokens(l) for l in label_str]
-    
-    pred_answers = [extract_answer(p) for p in pred_str]
-    label_answers = [extract_answer(l) for l in label_str]
-    
-    # Program token match
-    program_matches = 0
-    for pred_prog, label_prog in zip(pred_programs, label_programs):
-        if pred_prog == label_prog:
-            program_matches += 1
-    
-    # Answer matches (numerical with tolerance or exact)
-    answer_matches = 0
-    tolerance = 0.001  # 0.1% tolerance
-    
-    for pred, label in zip(pred_answers, label_answers):
-        if isinstance(pred, float) and isinstance(label, float):
-            # Numerical comparison with tolerance
-            if abs(pred - label) <= tolerance * max(1, abs(label)):
+def get_compute_metrics_fn(tokenizer):
+    """Create a compute_metrics function that has access to the tokenizer."""
+    def compute_metrics(eval_preds):
+        """Compute metrics for evaluation."""
+        preds, labels = eval_preds
+        
+        # Replace -100 with pad token id
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        
+        # Process in smaller batches to avoid OOM
+        batch_size = 16
+        num_samples = len(preds)
+        pred_str = []
+        label_str = []
+        
+        for i in range(0, num_samples, batch_size):
+            end_idx = min(i + batch_size, num_samples)
+            pred_str.extend(tokenizer.batch_decode(preds[i:end_idx], skip_special_tokens=True))
+            label_str.extend(tokenizer.batch_decode(labels[i:end_idx], skip_special_tokens=True))
+        
+        # Extract program tokens and answers
+        def extract_program_tokens(text):
+            program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
+            match = re.search(program_pattern, text, re.DOTALL)
+            if match:
+                program_text = match.group(1).strip()
+                return program_text.split()
+            return ["EOF"]
+        
+        def extract_answer(text):
+            answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+            match = re.search(answer_pattern, text, re.DOTALL)
+            if match:
+                solution = match.group(1).strip()
+                # Normalize numerical values
+                solution = solution.replace('%', '')
+                try:
+                    # Convert to float for numerical comparison
+                    return float(solution)
+                except:
+                    # If not a number, return as is
+                    return solution
+            return text.strip()
+        
+        # Extract programs and answers
+        pred_programs = [extract_program_tokens(p) for p in pred_str]
+        label_programs = [extract_program_tokens(l) for l in label_str]
+        
+        pred_answers = [extract_answer(p) for p in pred_str]
+        label_answers = [extract_answer(l) for l in label_str]
+        
+        # Program token match
+        program_matches = 0
+        for pred_prog, label_prog in zip(pred_programs, label_programs):
+            if pred_prog == label_prog:
+                program_matches += 1
+        
+        # Answer matches (numerical with tolerance or exact)
+        answer_matches = 0
+        tolerance = 0.001  # 0.1% tolerance
+        
+        for pred, label in zip(pred_answers, label_answers):
+            if isinstance(pred, float) and isinstance(label, float):
+                # Numerical comparison with tolerance
+                if abs(pred - label) <= tolerance * max(1, abs(label)):
+                    answer_matches += 1
+            elif pred == label:
                 answer_matches += 1
-        elif pred == label:
-            answer_matches += 1
+        
+        # Calculate metrics
+        program_match_percentage = program_matches / len(pred_str) * 100
+        answer_match_percentage = answer_matches / len(pred_str) * 100
+        
+        # Log examples to wandb
+        if wandb.run:
+            examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", "Pred Answer", "Label Answer"])
+            for p, l, pp, lp, pa, la in list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:5]:
+                examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la))
+            wandb.log({"eval_examples": examples_table})
+        
+        return {
+            "program_match": program_match_percentage,
+            "answer_match": answer_match_percentage,
+        }
     
-    # Calculate metrics
-    program_match_percentage = program_matches / len(pred_str) * 100
-    answer_match_percentage = answer_matches / len(pred_str) * 100
-    
-    # Log examples to wandb
-    if wandb.run:
-        examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", "Pred Answer", "Label Answer"])
-        for p, l, pp, lp, pa, la in list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:5]:
-            examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la))
-        wandb.log({"eval_examples": examples_table})
-    
-    return {
-        "program_match": program_match_percentage,
-        "answer_match": answer_match_percentage,
-    }
+    return compute_metrics
 
 
 def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
@@ -290,7 +294,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         dataset_num_proc=2,
         packing=False,
         args=training_args,
-        compute_metrics=compute_metrics if eval_dataset else None,
+        compute_metrics=get_compute_metrics_fn(tokenizer) if eval_dataset else None,
     )
     
     # Configure to train only on assistant responses
@@ -439,7 +443,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # Make tokenizer globally accessible for compute_metrics
-    tokenizer = None
     main()
 
