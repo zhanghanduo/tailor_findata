@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument("--eval_split_percentage", type=int, default=4, help="Percentage of data to use for evaluation")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Maximum number of samples to use for evaluation")
+    parser.add_argument("--force_dataset_download", action="store_true", default=False, help="Force redownload of dataset instead of using cache")
     args = parser.parse_args()
     
     # Ensure max_steps has a valid value
@@ -71,6 +72,7 @@ def setup_wandb(args):
         "num_train_epochs": args.num_train_epochs,
         "gradient_checkpointing": args.gradient_checkpointing,
         "max_eval_samples": args.max_eval_samples,
+        "force_dataset_download": args.force_dataset_download,
     }
     
     run_name = args.wandb_run_name or f"phi4-lora-r{args.lora_r}-bs{args.batch_size*args.gradient_accumulation_steps}"
@@ -157,7 +159,14 @@ def prepare_dataset(tokenizer, args):
     
     # Load dataset
     print(f"Loading dataset: {args.dataset_name}")
-    dataset = load_dataset(args.dataset_name, split="train")
+
+    dataset = load_dataset(
+        args.dataset_name, 
+        split="train",
+        cache_dir=None,  # Don't use cache
+        download_mode="force_redownload" if args.force_dataset_download else "reuse_dataset_if_exists",  # Force redownload if specified
+        verification_mode="no_checks"  # Skip verification checks
+    )
     dataset = standardize_sharegpt(dataset)
     
     # Create train/eval split
@@ -918,6 +927,7 @@ def main():
     print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
     print(f"  - Max eval samples: {args.max_eval_samples}")
     print(f"  - Max sequence length: {args.max_seq_length}")
+    print(f"  - Force dataset download: {args.force_dataset_download}")
     
     # Setup wandb
     wandb_run = setup_wandb(args)
