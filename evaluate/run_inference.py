@@ -67,7 +67,9 @@ def prepare_test_data(test_data_path):
                 "question": question
             })
         
-        test_dataset = load_dataset("json", data=test_examples, split="train")
+        # Create a dataset from the examples
+        from datasets import Dataset
+        test_dataset = Dataset.from_list(test_examples)
     
     # Extract example IDs
     example_ids = [example["id"] for example in test_dataset] if "id" in test_dataset.column_names else [f"example_{i}" for i in range(len(test_dataset))]
@@ -205,4 +207,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()  
