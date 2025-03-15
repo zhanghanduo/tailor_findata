@@ -4,3 +4,8 @@
 .venv/
 log/
 pip-cache/
+data/train.json
+data/dev.json
+processed_data/
+
+

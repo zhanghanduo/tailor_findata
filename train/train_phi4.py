@@ -1,7 +1,7 @@
 import os
 import argparse
 import wandb
-import torch
+import re
 import numpy as np
 from tqdm import tqdm
 from unsloth import FastLanguageModel, is_bfloat16_supported
@@ -14,7 +14,6 @@ from transformers import (
     TextStreamer,
     EvalPrediction
 )
-from peft import PeftModel
 
 
 def parse_args():
@@ -22,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Phi-4 with LoRA")
     parser.add_argument("--model_name", type=str, default="unsloth/phi-4", help="Base model to fine-tune")
     parser.add_argument("--cache_dir", type=str, default="/workspace/mnt/watt/public_models", help="Cache directory for models")
-    parser.add_argument("--dataset_name", type=str, default="christlurker/convqa_multiturn", help="Dataset to use for training")
+    parser.add_argument("--dataset_name", type=str, default="christlurker/finqa_sharegpt", help="Dataset to use for training")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save model checkpoints")
     parser.add_argument("--max_seq_length", type=int, default=8192, help="Maximum sequence length")
     parser.add_argument("--load_in_4bit", action="store_true", default=True, help="Whether to load in 4-bit quantization")
@@ -31,16 +30,16 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--max_steps", type=int, default=-1, help="Max training steps (overrides num_train_epochs if > 0)")
     parser.add_argument("--warmup_steps", type=int, default=5, help="Number of warmup steps")
     parser.add_argument("--logging_steps", type=int, default=1, help="Logging steps")
-    parser.add_argument("--eval_steps", type=int, default=50, help="Evaluation steps")
-    parser.add_argument("--save_steps", type=int, default=100, help="Save checkpoint steps")
+    parser.add_argument("--eval_steps", type=int, default=20, help="Evaluation steps")
+    parser.add_argument("--save_steps", type=int, default=50, help="Save checkpoint steps")
     parser.add_argument("--seed", type=int, default=3407, help="Random seed")
     parser.add_argument("--wandb_project", type=str, default="phi4-lora-sft", help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
-    parser.add_argument("--eval_split_percentage", type=int, default=5, help="Percentage of data to use for evaluation")
+    parser.add_argument("--eval_split_percentage", type=int, default=4, help="Percentage of data to use for evaluation")
     args = parser.parse_args()
     
     # Ensure max_steps has a valid value
@@ -166,20 +165,70 @@ def compute_metrics(eval_preds):
     # Decode predictions and labels
     pred_str = tokenizer.batch_decode(preds, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # Extract program tokens and answers
+    def extract_program_tokens(text):
+        program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
+        match = re.search(program_pattern, text, re.DOTALL)
+        if match:
+            program_text = match.group(1).strip()
+            return program_text.split()
+        return ["EOF"]
     
-    # Simple exact match metric
-    exact_matches = sum(1 for p, l in zip(pred_str, label_str) if p.strip() == l.strip())
-    exact_match_percentage = exact_matches / len(pred_str) * 100
+    def extract_answer(text):
+        answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+        match = re.search(answer_pattern, text, re.DOTALL)
+        if match:
+            solution = match.group(1).strip()
+            # Normalize numerical values
+            solution = solution.replace('%', '')
+            try:
+                # Convert to float for numerical comparison
+                return float(solution)
+            except:
+                # If not a number, return as is
+                return solution
+        return text.strip()
     
-    # Log a few examples to wandb
+    # Extract programs and answers
+    pred_programs = [extract_program_tokens(p) for p in pred_str]
+    label_programs = [extract_program_tokens(l) for l in label_str]
+    
+    pred_answers = [extract_answer(p) for p in pred_str]
+    label_answers = [extract_answer(l) for l in label_str]
+    
+    # Program token match
+    program_matches = 0
+    for pred_prog, label_prog in zip(pred_programs, label_programs):
+        if pred_prog == label_prog:
+            program_matches += 1
+    
+    # Answer matches (numerical with tolerance or exact)
+    answer_matches = 0
+    tolerance = 0.001  # 0.1% tolerance
+    
+    for pred, label in zip(pred_answers, label_answers):
+        if isinstance(pred, float) and isinstance(label, float):
+            # Numerical comparison with tolerance
+            if abs(pred - label) <= tolerance * max(1, abs(label)):
+                answer_matches += 1
+        elif pred == label:
+            answer_matches += 1
+    
+    # Calculate metrics
+    program_match_percentage = program_matches / len(pred_str) * 100
+    answer_match_percentage = answer_matches / len(pred_str) * 100
+    
+    # Log examples to wandb
     if wandb.run:
-        examples_table = wandb.Table(columns=["Prediction", "Reference"])
-        for p, l in list(zip(pred_str, label_str))[:5]:  # Log first 5 examples
-            examples_table.add_data(p, l)
+        examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", "Pred Answer", "Label Answer"])
+        for p, l, pp, lp, pa, la in list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:5]:
+            examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la))
         wandb.log({"eval_examples": examples_table})
     
     return {
-        "exact_match": exact_match_percentage,
+        "program_match": program_match_percentage,
+        "answer_match": answer_match_percentage,
     }
 
 
@@ -338,10 +387,6 @@ def main():
     print(f"  - Model: {args.model_name}")
     print(f"  - Dataset: {args.dataset_name}")
     print(f"  - Batch size: {args.batch_size}")
-    print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
-    print(f"  - Learning rate: {args.learning_rate}")
-    print(f"  - Max steps: {args.max_steps}")
-    print(f"  - Num train epochs: {args.num_train_epochs}")
     
     # Setup wandb
     wandb_run = setup_wandb(args)
