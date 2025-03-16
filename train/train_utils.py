@@ -2,7 +2,7 @@ import re
 import torch
 import numpy as np
 import wandb
-from difflib import SequenceMatche
+
 from datasets import Dataset
 from unsloth.chat_templates import get_chat_template, standardize_sharegpt
 
@@ -532,4 +532,4 @@ def safe_int_conversion(token, vocab_size):
     except (OverflowError, ValueError) as e:
         # If conversion fails due to value being too large
         print(f"  - Conversion error for token {token} (type: {type(token)}): {e}")
-        return None 
+        return None
