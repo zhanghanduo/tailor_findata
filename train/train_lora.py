@@ -842,6 +842,17 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         pred_ids = logits.argmax(dim=-1)
         return pred_ids
     
+    # Set padding and truncation settings for Qwen models
+    if "qwen" in args.model_name.lower():
+        print("Applying Qwen-specific padding and truncation settings")
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        
+        # Update model config if needed
+        if hasattr(model.config, "pad_token_id"):
+            model.config.pad_token_id = tokenizer.pad_token_id
+    
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -883,6 +894,15 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         from transformers import EarlyStoppingCallback
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
     
+    # Create data collator with padding
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        max_length=args.max_seq_length,
+        pad_to_multiple_of=8,  # Optimize for hardware
+        return_tensors="pt"
+    )
+    
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -890,7 +910,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         eval_dataset=eval_dataset,
         dataset_text_field="text",
         max_seq_length=args.max_seq_length,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
+        data_collator=data_collator,
         dataset_num_proc=2,
         packing=False,
         args=training_args,
