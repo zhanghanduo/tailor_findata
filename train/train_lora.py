@@ -142,7 +142,7 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Maximum number of samples to use for evaluation")
     parser.add_argument("--force_dataset_download", action="store_true", default=False, help="Force redownload of dataset instead of using cache")
-    parser.add_argument("--chat_template", type=str, default=None, help="Chat template to use (e.g., 'phi-4', 'llama-2', 'gemma', 'qwen', 'claude', 'phi-2', 'falcon', 'chatml'). If not specified, will be auto-detected based on model name.")
+    parser.add_argument("--chat_template", type=str, default=None, help="Chat template to use (e.g., 'phi-4', 'llama-2', 'gemma', 'qwen', 'yi', 'claude', 'phi-2', 'falcon', 'chatml'). If not specified, will be auto-detected based on model name.")
     args = parser.parse_args()
     
     # Ensure max_steps has a valid value
@@ -274,6 +274,8 @@ def load_model_and_tokenizer(args):
             chat_template = "phi-2"
         elif "falcon" in model_name_lower:
             chat_template = "falcon"
+        elif "yi" in model_name_lower:
+            chat_template = "yi"
         elif "claude" in model_name_lower:
             chat_template = "claude"
         else:
@@ -942,12 +944,34 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         callbacks=callbacks,
     )
     
-    # Configure to train only on assistant responses
-    trainer = train_on_responses_only(
-        trainer,
-        instruction_part="<|im_start|>human<|im_sep|>",
-        response_part="<|im_start|>assistant<|im_sep|>"
-    )
+    # Determine which response markers to use based on the model type
+    model_name_lower = args.model_name.lower()
+    
+    # Configure to train only on assistant responses with model-specific markers
+    if "qwen" in model_name_lower:
+        # For Qwen models, use their specific markers
+        print("Using Qwen-specific response markers for training")
+        trainer = train_on_responses_only(
+            trainer,
+            instruction_part="<|im_start|>user<|im_end|>",
+            response_part="<|im_start|>assistant<|im_end|>"
+        )
+    elif "yi" in model_name_lower:
+        # For Yi models, use their specific markers
+        print("Using Yi-specific response markers for training")
+        trainer = train_on_responses_only(
+            trainer,
+            instruction_part="<|im_start|>user<|im_end|>",
+            response_part="<|im_start|>assistant<|im_end|>"
+        )
+    else:
+        # Default behavior for other models
+        print("Using default response markers for training")
+        trainer = train_on_responses_only(
+            trainer,
+            instruction_part="<|im_start|>human<|im_sep|>",
+            response_part="<|im_start|>assistant<|im_sep|>"
+        )
     
     return trainer
 
