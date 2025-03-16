@@ -79,8 +79,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save model checkpoints")
     parser.add_argument("--max_seq_length", type=int, default=4096, help="Maximum sequence length")
     parser.add_argument("--load_in_4bit", action="store_true", default=True, help="Whether to load in 4-bit quantization")
-    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=8, help="LoRA alpha")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size per device")
     parser.add_argument("--eval_batch_size", type=int, default=1, help="Evaluation batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of gradient accumulation steps")
@@ -413,15 +413,6 @@ def prepare_dataset(tokenizer, args):
     return train_dataset, eval_dataset
 
 
-
-
-
-
-    
-    print(f"===== CUSTOM TRAIN_ON_RESPONSES_ONLY APPLIED =====\n")
-    return trainer
-
-
 def analyze_predictions(pred_str, label_str, pred_answers, label_answers, step=None):
     """Analyze prediction patterns to understand model behavior."""
     analysis = {
@@ -563,6 +554,58 @@ def get_compute_metrics_fn(tokenizer):
                 return None
         
         try:
+            # Check if we're using a Qwen model and have access to the dataset
+            is_qwen = "qwen" in tokenizer.__class__.__name__.lower()
+            has_last_responses = False
+            
+            # For Qwen models, try to get the last_assistant_response directly from the dataset
+            if is_qwen and hasattr(trainer, 'eval_dataset'):
+                print("\nChecking for last_assistant_response field in eval_dataset...")
+                sample = trainer.eval_dataset[0] if len(trainer.eval_dataset) > 0 else {}
+                has_last_responses = "last_assistant_response" in sample
+                
+                if has_last_responses:
+                    print("✅ Found last_assistant_response field in evaluation dataset!")
+                    # We'll use this field directly for labels
+                    
+                    # Get all the last_assistant_responses
+                    last_responses = [example["last_assistant_response"] for example in trainer.eval_dataset]
+                    print(f"Loaded {len(last_responses)} last_assistant_responses")
+                    
+                    # Use these as the ground truth labels
+                    if len(last_responses) == num_samples:
+                        print("Using last_assistant_response field as ground truth labels")
+                        
+                        # Process the last_assistant_responses to extract the answers
+                        processed_labels = []
+                        for response in last_responses:
+                            # Extract the answer from the response
+                            answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+                            answer_match = re.search(answer_pattern, response, re.DOTALL)
+                            
+                            if answer_match:
+                                # Format the answer with the expected tags
+                                answer = answer_match.group(1).strip()
+                                processed_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer}\n<end_of_answer>"
+                                processed_labels.append(processed_label)
+                            else:
+                                # If no answer tag found, use the whole response
+                                processed_labels.append(response)
+                        
+                        # Use the processed labels
+                        label_str = processed_labels
+                        
+                        # Skip the normal label processing for these
+                        skip_label_processing = True
+                    else:
+                        print(f"Warning: Number of last_assistant_responses ({len(last_responses)}) doesn't match number of samples ({num_samples})")
+                        skip_label_processing = False
+                else:
+                    print("❌ last_assistant_response field not found in evaluation dataset")
+                    skip_label_processing = False
+            else:
+                skip_label_processing = False
+            
             # Safer approach: process one sample at a time
             for i in range(num_samples):
                 print(f"Processing sample {i+1}/{num_samples}...", end="\r")
@@ -612,66 +655,65 @@ def get_compute_metrics_fn(tokenizer):
                     # Add empty string as fallback
                     pred_str.append("")
                 
-                # Process label
-                try:
-                    # Get the mask for this sample
-                    sample_mask = label_mask[i]
-                    # Get only the valid tokens (not -100)
-                    valid_label_tokens = labels[i][sample_mask].tolist() if hasattr(labels[i][sample_mask], 'tolist') else labels[i][sample_mask]
-                    
-                    # Filter out any values that are too large
-                    valid_tokens = []
-                    invalid_count = 0
-                    for token in valid_label_tokens:
-                        safe_token = safe_int_conversion(token)
-                        if safe_token is not None:
-                            valid_tokens.append(safe_token)
-                        else:
-                            invalid_count += 1
-                    
-                    if invalid_count > 0 and (i < 2 or i >= num_samples - 2):
-                        print(f"\nSample {i} (label): Filtered out {invalid_count} invalid tokens")
-                    
+                # Process label (skip if we're using last_assistant_response)
+                if not skip_label_processing:
                     try:
-                        # Add a check for empty token list
-                        if not valid_tokens:
-                            print(f"\nSample {i} (label): No valid tokens to decode")
-                            decoded_label = ""
-                        else:
-                            decoded_label = tokenizer.decode(valid_tokens, skip_special_tokens=True)
-                            
-                            # IMPORTANT FIX: For Qwen models, extract the actual answer from the label
-                            # This fixes the issue where labels are showing up as "and" instead of the actual answer
-                            # Check if we're using a Qwen model based on tokenizer name
-                            is_qwen = "qwen" in tokenizer.__class__.__name__.lower()
-                            
-                            if is_qwen:
-                                # Look for the assistant's response in the decoded label
-                                assistant_pattern = r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>'
-                                assistant_matches = re.findall(assistant_pattern, decoded_label, re.DOTALL)
+                        # Get the mask for this sample
+                        sample_mask = label_mask[i]
+                        # Get only the valid tokens (not -100)
+                        valid_label_tokens = labels[i][sample_mask].tolist() if hasattr(labels[i][sample_mask], 'tolist') else labels[i][sample_mask]
+                        
+                        # Filter out any values that are too large
+                        valid_tokens = []
+                        invalid_count = 0
+                        for token in valid_label_tokens:
+                            safe_token = safe_int_conversion(token)
+                            if safe_token is not None:
+                                valid_tokens.append(safe_token)
+                            else:
+                                invalid_count += 1
+                        
+                        if invalid_count > 0 and (i < 2 or i >= num_samples - 2):
+                            print(f"\nSample {i} (label): Filtered out {invalid_count} invalid tokens")
+                        
+                        try:
+                            # Add a check for empty token list
+                            if not valid_tokens:
+                                print(f"\nSample {i} (label): No valid tokens to decode")
+                                decoded_label = ""
+                            else:
+                                decoded_label = tokenizer.decode(valid_tokens, skip_special_tokens=True)
                                 
-                                if assistant_matches:
-                                    # Use the last assistant response as the label
-                                    decoded_label = assistant_matches[-1].strip()
-                                    print(f"\nSample {i}: Extracted assistant response from Qwen format: {decoded_label[:50]}...")
-                                else:
-                                    # Fallback: Try to extract the answer directly
-                                    answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
-                                    answer_match = re.search(answer_pattern, decoded_label, re.DOTALL)
-                                    if answer_match:
-                                        decoded_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer_match.group(1).strip()}\n<end_of_answer>"
-                                        print(f"\nSample {i}: Extracted answer directly: {answer_match.group(1).strip()}")
+                                # IMPORTANT FIX: For Qwen models, extract the actual answer from the label
+                                # This fixes the issue where labels are showing up as "and" instead of the actual answer
+                                # Check if we're using a Qwen model based on tokenizer name
+                                if is_qwen:
+                                    # Look for the assistant's response in the decoded label
+                                    assistant_pattern = r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>'
+                                    assistant_matches = re.findall(assistant_pattern, decoded_label, re.DOTALL)
+                                    
+                                    if assistant_matches:
+                                        # Use the last assistant response as the label
+                                        decoded_label = assistant_matches[-1].strip()
+                                        print(f"\nSample {i}: Extracted assistant response from Qwen format: {decoded_label[:50]}...")
+                                    else:
+                                        # Fallback: Try to extract the answer directly
+                                        answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+                                        answer_match = re.search(answer_pattern, decoded_label, re.DOTALL)
+                                        if answer_match:
+                                            decoded_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer_match.group(1).strip()}\n<end_of_answer>"
+                                            print(f"\nSample {i}: Extracted answer directly: {answer_match.group(1).strip()}")
+                        except Exception as e:
+                            print(f"\nError in tokenizer.decode for label {i}: {e}")
+                            print(f"Valid tokens: {valid_tokens[:10]}{'...' if len(valid_tokens) > 10 else ''}")
+                            decoded_label = ""
+                        
+                        label_str.append(decoded_label)
                     except Exception as e:
-                        print(f"\nError in tokenizer.decode for label {i}: {e}")
-                        print(f"Valid tokens: {valid_tokens[:10]}{'...' if len(valid_tokens) > 10 else ''}")
-                        decoded_label = ""
-                    
-                    label_str.append(decoded_label)
-                except Exception as e:
-                    print(f"\nError decoding label {i}: {e}")
-                    print(f"Label type: {type(labels[i])}")
-                    # Add empty string as fallback
-                    label_str.append("")
+                        print(f"\nError decoding label {i}: {e}")
+                        print(f"Label type: {type(labels[i])}")
+                        # Add empty string as fallback
+                        label_str.append("")
             
             print("\nFinished decoding all samples")
             print(f"Total samples processed: {num_samples}")
@@ -1034,6 +1076,9 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
                 original_compute_metrics = get_compute_metrics_fn(tokenizer)
                 
                 def qwen_compute_metrics(eval_preds):
+                    # Store a reference to the trainer for use in compute_metrics
+                    global trainer
+                    
                     # Call the original compute_metrics function
                     metrics = original_compute_metrics(eval_preds)
                     
