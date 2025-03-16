@@ -120,52 +120,80 @@ def debug_tokenized_dataset(tokenizer, dataset, num_samples=2):
     
     for i, sample in enumerate(samples):
         print(f"\nSample {i+1}:")
-        text = sample["text"]
-        print(f"Raw text (first 100 chars): {text[:100]}...")
         
-        # Tokenize the text
-        tokenized = tokenizer(text, return_tensors="pt")
-        input_ids = tokenized["input_ids"][0]
-        
-        # Decode back to see what the tokenizer understood
-        decoded = tokenizer.decode(input_ids)
-        print(f"Decoded (first 100 chars): {decoded[:100]}...")
-        
-        # Check for key markers
-        user_marker = "<|im_start|>user"
-        assistant_marker = "<|im_start|>assistant"
-        
-        user_pos = text.find(user_marker)
-        assistant_pos = text.find(assistant_marker)
-        
-        print(f"User marker position: {user_pos}")
-        print(f"Assistant marker position: {assistant_pos}")
-        
-        # Check if markers are present in the expected order
-        if user_pos >= 0 and assistant_pos >= 0 and user_pos < assistant_pos:
-            print("✅ Markers found in correct order")
-        else:
-            print("❌ Markers not found in correct order")
-        
-        # Try to manually apply train_on_responses_only logic
-        instruction_part = "<|im_start|>user\n"
-        response_part = "<|im_start|>assistant\n"
-        
-        instruction_pos = text.find(instruction_part)
-        response_pos = text.find(response_part)
-        
-        if instruction_pos >= 0 and response_pos >= 0:
-            print(f"Instruction part found at: {instruction_pos}")
-            print(f"Response part found at: {response_pos}")
+        # Check if the dataset is already tokenized
+        if "input_ids" in sample and "text" not in sample:
+            print("Dataset is already tokenized (no 'text' field)")
+            input_ids = sample["input_ids"]
+            if isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids.tolist()
             
-            # Get the text between markers
-            instruction_text = text[instruction_pos:response_pos]
-            response_text = text[response_pos:]
+            # Decode to see what the tokenizer understood
+            decoded = tokenizer.decode(input_ids)
+            print(f"Decoded from input_ids (first 100 chars): {decoded[:100]}...")
             
-            print(f"Instruction text (first 50 chars): {instruction_text[:50]}...")
-            print(f"Response text (first 50 chars): {response_text[:50]}...")
+            # Check token counts
+            print(f"Input IDs length: {len(input_ids)}")
+            if "attention_mask" in sample:
+                attention_mask = sample["attention_mask"]
+                if isinstance(attention_mask, torch.Tensor):
+                    attention_mask = attention_mask.tolist()
+                print(f"Attention mask length: {len(attention_mask)}")
+                
+            # We can't do further analysis without the raw text
+            continue
+        
+        # If we have the text field, proceed with normal debugging
+        if "text" in sample:
+            text = sample["text"]
+            print(f"Raw text (first 100 chars): {text[:100]}...")
+            
+            # Tokenize the text
+            tokenized = tokenizer(text, return_tensors="pt")
+            input_ids = tokenized["input_ids"][0]
+            
+            # Decode back to see what the tokenizer understood
+            decoded = tokenizer.decode(input_ids)
+            print(f"Decoded (first 100 chars): {decoded[:100]}...")
+            
+            # Check for key markers
+            user_marker = "<|im_start|>user"
+            assistant_marker = "<|im_start|>assistant"
+            
+            user_pos = text.find(user_marker)
+            assistant_pos = text.find(assistant_marker)
+            
+            print(f"User marker position: {user_pos}")
+            print(f"Assistant marker position: {assistant_pos}")
+            
+            # Check if markers are present in the expected order
+            if user_pos >= 0 and assistant_pos >= 0 and user_pos < assistant_pos:
+                print("✅ Markers found in correct order")
+            else:
+                print("❌ Markers not found in correct order")
+            
+            # Try to manually apply train_on_responses_only logic
+            instruction_part = "<|im_start|>user\n"
+            response_part = "<|im_start|>assistant\n"
+            
+            instruction_pos = text.find(instruction_part)
+            response_pos = text.find(response_part)
+            
+            if instruction_pos >= 0 and response_pos >= 0:
+                print(f"Instruction part found at: {instruction_pos}")
+                print(f"Response part found at: {response_pos}")
+                
+                # Get the text between markers
+                instruction_text = text[instruction_pos:response_pos]
+                response_text = text[response_pos:]
+                
+                print(f"Instruction text (first 50 chars): {instruction_text[:50]}...")
+                print(f"Response text (first 50 chars): {response_text[:50]}...")
+            else:
+                print("❌ Could not find instruction or response parts with exact markers")
         else:
-            print("❌ Could not find instruction or response parts with exact markers")
+            print("Dataset sample does not contain 'text' or 'input_ids' fields")
+            print(f"Available keys: {list(sample.keys())}")
     
     print("\n===== END DEBUGGING =====")
 
