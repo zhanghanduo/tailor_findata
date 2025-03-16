@@ -361,45 +361,29 @@ def run_inference(model, tokenizer, test_dataset, args):
             
             # Extract just the assistant's response
             try:
-                # First try to extract using program and answer tags directly
-                program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
-                program_match = re.search(program_pattern, decoded_output, re.DOTALL)
+                # Check if we're using a Qwen model
+                is_qwen = "qwen" in args.model_path.lower()
                 
-                answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
-                answer_match = re.search(answer_pattern, decoded_output, re.DOTALL)
-                
-                if program_match and answer_match:
-                    # If both tags are found, create a clean response with just these elements
-                    program_content = program_match.group(1).strip()
-                    answer_content = answer_match.group(1).strip()
+                # For Qwen models, use their specific format
+                if is_qwen:
+                    # Extract using Qwen's specific format
+                    assistant_pattern = r'<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)'
+                    assistant_matches = re.findall(assistant_pattern, decoded_output, re.DOTALL)
                     
-                    clean_response = (
-                        f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
-                        f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
-                    )
-                    assistant_response = clean_response
-                else:
-                    # If tags aren't found, try to extract the assistant's response using the chat template
-                    assistant_prefix = tokenizer.apply_chat_template([{"role": "assistant", "content": ""}], tokenize=False)
-                    user_prefix = tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=False)
-                    
-                    # Find where the assistant's response starts
-                    if assistant_prefix in decoded_output:
-                        assistant_response = decoded_output.split(assistant_prefix)[-1]
-                        # Remove any trailing user message if present
-                        if user_prefix in assistant_response:
-                            assistant_response = assistant_response.split(user_prefix)[0]
-                    else:
-                        # Fallback: just use the entire output
-                        assistant_response = decoded_output
+                    if assistant_matches:
+                        # Use the last assistant response
+                        assistant_response = assistant_matches[-1].strip()
+                        print(f"Extracted Qwen assistant response (first 50 chars): {assistant_response[:50]}...")
                         
-                    # Try to clean up the response by removing system prompt and user message
-                    if "system" in assistant_response.lower() and "user" in assistant_response.lower():
-                        # Look for program and answer tags in the messy output
+                        # Now look for program and answer tags within the assistant response
+                        program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
                         program_match = re.search(program_pattern, assistant_response, re.DOTALL)
+                        
+                        answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
                         answer_match = re.search(answer_pattern, assistant_response, re.DOTALL)
                         
                         if program_match and answer_match:
+                            # If both tags are found, create a clean response with just these elements
                             program_content = program_match.group(1).strip()
                             answer_content = answer_match.group(1).strip()
                             
@@ -408,6 +392,58 @@ def run_inference(model, tokenizer, test_dataset, args):
                                 f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
                             )
                             assistant_response = clean_response
+                            print(f"Extracted program and answer from Qwen response: {assistant_response[:100]}...")
+                    else:
+                        # Fallback to standard extraction
+                        assistant_response = decoded_output
+                else:
+                    # First try to extract using program and answer tags directly
+                    program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
+                    program_match = re.search(program_pattern, decoded_output, re.DOTALL)
+                    
+                    answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
+                    answer_match = re.search(answer_pattern, decoded_output, re.DOTALL)
+                    
+                    if program_match and answer_match:
+                        # If both tags are found, create a clean response with just these elements
+                        program_content = program_match.group(1).strip()
+                        answer_content = answer_match.group(1).strip()
+                        
+                        clean_response = (
+                            f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                            f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+                        )
+                        assistant_response = clean_response
+                    else:
+                        # If tags aren't found, try to extract the assistant's response using the chat template
+                        assistant_prefix = tokenizer.apply_chat_template([{"role": "assistant", "content": ""}], tokenize=False)
+                        user_prefix = tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=False)
+                        
+                        # Find where the assistant's response starts
+                        if assistant_prefix in decoded_output:
+                            assistant_response = decoded_output.split(assistant_prefix)[-1]
+                            # Remove any trailing user message if present
+                            if user_prefix in assistant_response:
+                                assistant_response = assistant_response.split(user_prefix)[0]
+                        else:
+                            # Fallback: just use the entire output
+                            assistant_response = decoded_output
+                            
+                        # Try to clean up the response by removing system prompt and user message
+                        if "system" in assistant_response.lower() and "user" in assistant_response.lower():
+                            # Look for program and answer tags in the messy output
+                            program_match = re.search(program_pattern, assistant_response, re.DOTALL)
+                            answer_match = re.search(answer_pattern, assistant_response, re.DOTALL)
+                            
+                            if program_match and answer_match:
+                                program_content = program_match.group(1).strip()
+                                answer_content = answer_match.group(1).strip()
+                                
+                                clean_response = (
+                                    f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                                    f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+                                )
+                                assistant_response = clean_response
                 
                 # Check if the output is valid
                 if not is_valid_output(assistant_response):

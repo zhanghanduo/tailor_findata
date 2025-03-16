@@ -21,6 +21,7 @@ from train_utils import (
     debug_tokenized_dataset,
     custom_train_on_responses_only
 )
+import random
 
 
 
@@ -330,6 +331,44 @@ def prepare_dataset(tokenizer, args):
             batched=True,
             num_proc=2,
         )
+        
+        # For Qwen models, add additional processing for the evaluation dataset
+        if "qwen" in args.model_name.lower():
+            print("Applying additional processing for Qwen evaluation dataset")
+            
+            # Function to extract the last assistant response for each conversation
+            def extract_last_assistant_response(example):
+                text = example["text"]
+                
+                # For debugging
+                if random.random() < 0.05:  # Print ~5% of examples
+                    print(f"\nQwen eval example text (first 200 chars): {text[:200]}...")
+                
+                # Extract all assistant responses
+                assistant_pattern = r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>'
+                assistant_responses = re.findall(assistant_pattern, text, re.DOTALL)
+                
+                # Use the last assistant response as the ground truth
+                if assistant_responses:
+                    last_response = assistant_responses[-1].strip()
+                    
+                    # For debugging
+                    if random.random() < 0.05:  # Print ~5% of examples
+                        print(f"Extracted last assistant response: {last_response}")
+                    
+                    # Store the last response for evaluation
+                    example["last_assistant_response"] = last_response
+                else:
+                    example["last_assistant_response"] = ""
+                    
+                return example
+            
+            # Apply the extraction
+            eval_dataset = eval_dataset.map(
+                extract_last_assistant_response,
+                batched=False,
+                desc="Extracting last assistant responses for Qwen evaluation"
+            )
     
     # For Qwen models, tokenize the dataset with explicit padding and truncation
     if "qwen" in args.model_name.lower():
@@ -600,6 +639,27 @@ def get_compute_metrics_fn(tokenizer):
                             decoded_label = ""
                         else:
                             decoded_label = tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                            
+                            # IMPORTANT FIX: For Qwen models, extract the actual answer from the label
+                            # This fixes the issue where labels are showing up as "and" instead of the actual answer
+                            is_qwen = "qwen" in trainer.args.model_name_or_path.lower() if hasattr(trainer.args, "model_name_or_path") else False
+                            
+                            if is_qwen:
+                                # Look for the assistant's response in the decoded label
+                                assistant_pattern = r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>'
+                                assistant_matches = re.findall(assistant_pattern, decoded_label, re.DOTALL)
+                                
+                                if assistant_matches:
+                                    # Use the last assistant response as the label
+                                    decoded_label = assistant_matches[-1].strip()
+                                    print(f"\nSample {i}: Extracted assistant response from Qwen format: {decoded_label[:50]}...")
+                                else:
+                                    # Fallback: Try to extract the answer directly
+                                    answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+                                    answer_match = re.search(answer_pattern, decoded_label, re.DOTALL)
+                                    if answer_match:
+                                        decoded_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer_match.group(1).strip()}\n<end_of_answer>"
+                                        print(f"\nSample {i}: Extracted answer directly: {answer_match.group(1).strip()}")
                     except Exception as e:
                         print(f"\nError in tokenizer.decode for label {i}: {e}")
                         print(f"Valid tokens: {valid_tokens[:10]}{'...' if len(valid_tokens) > 10 else ''}")
@@ -709,6 +769,31 @@ def get_compute_metrics_fn(tokenizer):
                 except Exception as e:
                     print(f"Error processing prediction answer: {e}")
                     pred_answers.append("")
+            
+            # Check if we're using a Qwen model and have last_assistant_response available
+            is_qwen = False
+            has_last_responses = False
+            
+            if hasattr(trainer, "args") and hasattr(trainer.args, "model_name_or_path"):
+                is_qwen = "qwen" in trainer.args.model_name_or_path.lower()
+                
+            if is_qwen and hasattr(trainer, "eval_dataset"):
+                # Check if the dataset has the last_assistant_response field
+                sample = trainer.eval_dataset[0] if len(trainer.eval_dataset) > 0 else {}
+                has_last_responses = "last_assistant_response" in sample
+                
+                if has_last_responses:
+                    print("\nUsing extracted last_assistant_response for Qwen model evaluation")
+                    
+                    # Replace label_str with the extracted responses
+                    label_str = []
+                    for i in range(min(len(pred_str), len(trainer.eval_dataset))):
+                        try:
+                            response = trainer.eval_dataset[i]["last_assistant_response"]
+                            label_str.append(response)
+                        except Exception as e:
+                            print(f"Error getting last_assistant_response for sample {i}: {e}")
+                            label_str.append("")
             
             for l in label_str:
                 try:
@@ -953,6 +1038,40 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
             pad_to_multiple_of=8,
             return_tensors="pt"
         )
+        
+        # For Qwen models, add special handling for evaluation
+        if eval_dataset:
+            print("Adding special handling for Qwen model evaluation")
+            
+            # Check if the dataset has the last_assistant_response field
+            sample = eval_dataset[0] if len(eval_dataset) > 0 else {}
+            has_last_responses = "last_assistant_response" in sample
+            
+            if has_last_responses:
+                print("Found last_assistant_response field in evaluation dataset")
+                
+                # Create a custom compute_metrics function that uses the last_assistant_response
+                original_compute_metrics = get_compute_metrics_fn(tokenizer)
+                
+                def qwen_compute_metrics(eval_preds):
+                    # Call the original compute_metrics function
+                    metrics = original_compute_metrics(eval_preds)
+                    
+                    # Add a note that we're using the special Qwen handling
+                    metrics["using_qwen_special_handling"] = True
+                    
+                    return metrics
+                
+                # Use the custom compute_metrics function
+                compute_metrics_fn = qwen_compute_metrics
+            else:
+                # Use the standard compute_metrics function
+                compute_metrics_fn = get_compute_metrics_fn(tokenizer)
+        else:
+            compute_metrics_fn = None
+    else:
+        # For non-Qwen models, use the standard compute_metrics function
+        compute_metrics_fn = get_compute_metrics_fn(tokenizer) if eval_dataset else None
     
     trainer = SFTTrainer(
         model=model,
@@ -965,7 +1084,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         dataset_num_proc=2,
         packing=False,
         args=training_args,
-        compute_metrics=get_compute_metrics_fn(tokenizer) if eval_dataset else None,
+        compute_metrics=compute_metrics_fn,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset else None,
         callbacks=callbacks,
     )

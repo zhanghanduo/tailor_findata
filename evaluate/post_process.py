@@ -10,6 +10,16 @@ def extract_program_tokens(text):
     Extract program tokens from model output.
     Looks for content between <begin_of_program> and <end_of_program> tags.
     """
+    # Check if this is a Qwen model output and extract the assistant response first
+    if "<|im_start|>" in text and "<|im_end|>" in text:
+        # Extract the assistant's response
+        assistant_pattern = r'<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)'
+        assistant_matches = re.findall(assistant_pattern, text, re.DOTALL)
+        
+        if assistant_matches:
+            # Use the last assistant response
+            text = assistant_matches[-1].strip()
+    
     # First try to find the program section
     program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
     match = re.search(program_pattern, text, re.DOTALL)
@@ -171,11 +181,35 @@ def extract_answer(text):
     Extract the final answer from model output.
     Looks for content between <begin_of_answer> and <end_of_answer> tags.
     """
+    # Check if this is a Qwen model output and extract the assistant response first
+    if "<|im_start|>" in text and "<|im_end|>" in text:
+        # Extract the assistant's response
+        assistant_pattern = r'<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)'
+        assistant_matches = re.findall(assistant_pattern, text, re.DOTALL)
+        
+        if assistant_matches:
+            # Use the last assistant response
+            text = assistant_matches[-1].strip()
+    
+    # Look for answer tags
     answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
     match = re.search(answer_pattern, text, re.DOTALL)
     
     if match:
         return match.group(1).strip()
+    
+    # If no answer tags found, try to find numerical answers in the text
+    # Look for patterns like "The answer is X" or "= X"
+    alt_patterns = [
+        r'(?:answer|result|value)(?:\s+is|\s*[:=])\s*([-+]?\d*\.?\d*)',
+        r'(?:=|equals)\s*([-+]?\d*\.?\d*)',
+        r'(?:[\$£€])\s*([-+]?\d*\.?\d*)'
+    ]
+    
+    for pattern in alt_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
     
     return "N/A"
 
@@ -188,6 +222,38 @@ def clean_model_output(text):
     # First, check if the text contains system/user messages
     contains_system = "system" in text.lower()
     contains_user = "user" in text.lower()
+    
+    # Check if this is a Qwen model output
+    is_qwen_output = "<|im_start|>" in text and "<|im_end|>" in text
+    
+    # For Qwen models, extract the assistant response first
+    if is_qwen_output:
+        # Extract the assistant's response
+        assistant_pattern = r'<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)'
+        assistant_matches = re.findall(assistant_pattern, text, re.DOTALL)
+        
+        if assistant_matches:
+            # Use the last assistant response
+            text = assistant_matches[-1].strip()
+            print(f"Extracted Qwen assistant response for cleaning (first 50 chars): {text[:50]}...")
+            
+            # Now look for program and answer tags within the assistant response
+            program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
+            program_match = re.search(program_pattern, text, re.DOTALL)
+            
+            answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
+            answer_match = re.search(answer_pattern, text, re.DOTALL)
+            
+            if program_match and answer_match:
+                # If both tags are found, create a clean response with just these elements
+                program_content = program_match.group(1).strip()
+                answer_content = answer_match.group(1).strip()
+                
+                clean_output = (
+                    f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                    f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+                )
+                return clean_output
     
     # Extract program section
     program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
@@ -375,6 +441,40 @@ def format_predictions_for_evaluation(predictions, example_ids):
     
     for i, (pred, example_id) in enumerate(zip(predictions, example_ids)):
         try:
+            # Check if this is a Qwen model output
+            is_qwen_output = "<|im_start|>" in pred and "<|im_end|>" in pred
+            
+            if is_qwen_output:
+                # Extract the assistant's response first
+                assistant_pattern = r'<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>|$)'
+                assistant_matches = re.findall(assistant_pattern, pred, re.DOTALL)
+                
+                if assistant_matches:
+                    # Use the last assistant response
+                    pred = assistant_matches[-1].strip()
+                    if i < 3:  # Debug info for first few examples
+                        print(f"\nExtracted Qwen assistant response for example {i} (first 50 chars): {pred[:50]}...")
+                    
+                    # Look for program and answer tags directly in the assistant response
+                    program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
+                    program_match = re.search(program_pattern, pred, re.DOTALL)
+                    
+                    answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
+                    answer_match = re.search(answer_pattern, pred, re.DOTALL)
+                    
+                    if program_match and answer_match:
+                        # If both tags are found, create a clean response with just these elements
+                        program_content = program_match.group(1).strip()
+                        answer_content = answer_match.group(1).strip()
+                        
+                        # Create a clean output
+                        pred = (
+                            f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                            f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+                        )
+                        if i < 3:  # Debug info for first few examples
+                            print(f"Extracted program and answer from Qwen response for example {i}: {pred[:100]}...")
+            
             # First clean the output
             cleaned_output = clean_model_output(pred)
             
