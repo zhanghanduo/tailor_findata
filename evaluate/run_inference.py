@@ -7,6 +7,7 @@ from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from post_process import extract_program_tokens, extract_answer, format_predictions_for_evaluation
+from bs4 import BeautifulSoup
 
 
 def parse_args():
@@ -22,6 +23,51 @@ def parse_args():
     parser.add_argument("--load_in_4bit", action="store_true", help="Whether to load in 4-bit quantization")
     
     return parser.parse_args()
+
+
+def format_table_for_llm(html_table):
+    """Convert HTML table to a markdown-style text table that's easier for LLMs to understand"""
+    soup = BeautifulSoup(html_table, 'html.parser')
+    
+    # Extract all rows
+    rows = soup.find_all('tr')
+    if not rows:
+        return "No table data found."
+    
+    # Process the table data
+    table_data = []
+    for row in rows:
+        cells = row.find_all('td')
+        # Skip the first cell if it's just a row number
+        if cells and cells[0].text.strip().isdigit():
+            row_data = [cell.text.strip() for cell in cells[1:]]
+        else:
+            row_data = [cell.text.strip() for cell in cells]
+        table_data.append(row_data)
+    
+    # Format as a clean text table
+    if not table_data:
+        return "Empty table."
+    
+    # Determine column widths for proper alignment
+    col_widths = [max(len(row[i]) for row in table_data if i < len(row)) 
+                    for i in range(max(len(row) for row in table_data))]
+    
+    # Create header row with column names
+    header_row = table_data[0]
+    header_separator = ['-' * width for width in col_widths]
+    
+    # Format the table with proper alignment
+    formatted_table = []
+    formatted_table.append(' | '.join(header_row[i].ljust(col_widths[i]) for i in range(len(header_row))))
+    formatted_table.append(' | '.join(header_separator[i] for i in range(len(header_separator))))
+    
+    # Add data rows
+    for row in table_data[1:]:
+        formatted_table.append(' | '.join(row[i].ljust(col_widths[i]) if i < len(row) else ' ' * col_widths[i] 
+                                        for i in range(len(col_widths))))
+    
+    return '\n'.join(formatted_table)
 
 
 def prepare_test_data(test_data_path):
@@ -50,16 +96,22 @@ def prepare_test_data(test_data_path):
         test_examples = []
         for example in test_data:
             # Extract necessary information
-            example_id = example["id"]
-            pre_text = example.get("pre_text", "")
-            post_text = example.get("post_text", "")
-            table = example.get("table", "")
+            example_id = example.get("id", "")
+            
+            # Extract context information from annotation
+            annos = example.get('annotation', {})
+            pre_text = annos.get('amt_pre_text', '')
+            post_text = annos.get('amt_post_text', '')
+            html_table = annos.get('amt_table', '').replace('<td></td>', '<td>-</td>')
+            
+            # Format table for better LLM understanding
+            formatted_table = format_table_for_llm(html_table)
             
             # Create context
-            context = f"{pre_text}\n\n{table}\n\n{post_text}"
+            context = f'{pre_text}\n\n{formatted_table}\n\n{post_text}'
             
             # Get the question (first turn of the conversation)
-            question = example["annotation"]["dialogue_break"][0] if "dialogue_break" in example["annotation"] else ""
+            question = annos.get("dialogue_break", [""])[0] if annos.get("dialogue_break") else ""
             
             test_examples.append({
                 "id": example_id,
@@ -82,6 +134,39 @@ def prepare_test_data(test_data_path):
     return test_dataset, example_ids
 
 
+def get_system_prompt():
+    """Return the system prompt for ConvFinQA task."""
+    return """Your role is to solve financial questions by generating both the program tokens that represent the calculation and the final answer. 
+For each question, ONLY provide:
+1. The program tokens that represent the calculation using <begin_of_program> and <end_of_program> tags
+2. The final answer using <begin_of_answer> and <end_of_answer> tags
+
+The program tokens should follow this EXACT format:
+<begin_of_program>
+operation_name( number1 number2 ) EOF
+<end_of_program>
+
+<begin_of_answer>
+numerical_result
+<end_of_answer>
+
+Examples of operations:
+- For addition: add( number1 number2 ) EOF
+- For subtraction: subtract( number1 number2 ) EOF
+- For multiplication: multiply( number1 number2 ) EOF
+- For division: divide( number1 number2 ) EOF
+
+IMPORTANT: 
+- Always include the # symbol before reference numbers (e.g., #0, #1)
+- Never omit any part of the format
+- Always end program tokens with the EOF token
+- The answer should be ONLY the numerical result without any additional text, units, or explanations
+- DO NOT include any financial context, table data, or explanations in your response
+- DO NOT include any text outside of the specified tags
+
+Your response should ONLY contain the program tokens and answer within their respective tags."""
+
+
 def run_inference(model, tokenizer, test_dataset, args):
     """
     Run inference on test dataset.
@@ -96,6 +181,9 @@ def run_inference(model, tokenizer, test_dataset, args):
         predictions: List of model outputs
     """
     predictions = []
+    
+    # Get system prompt
+    system_prompt = get_system_prompt()
     
     # Debug: Print dataset info
     print(f"Dataset type: {type(test_dataset)}")
@@ -120,8 +208,14 @@ def run_inference(model, tokenizer, test_dataset, args):
                 context = test_dataset[i]["context"] if "context" in test_dataset.column_names else ""
                 question = test_dataset[i]["question"] if "question" in test_dataset.column_names else ""
                 
-            # Create prompt
-            prompt = f"I'm looking at some financial data. Here's the context:\n\n{context}\n\n{question}"
+            # Create prompt with system prompt
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"I'm looking at some financial data. Here's the context:\n\n{context}\n\n{question}"}
+            ]
+            
+            # Format messages for the model
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False)
             
             # Tokenize
             inputs = tokenizer(
@@ -143,7 +237,12 @@ def run_inference(model, tokenizer, test_dataset, args):
             
             # Decode
             decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            predictions.append(decoded_output)
+            
+            # Extract just the assistant's response
+            assistant_response = decoded_output.split(tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=False))[0]
+            assistant_response = assistant_response.split(tokenizer.apply_chat_template([{"role": "assistant", "content": ""}], tokenize=False))[-1]
+            
+            predictions.append(assistant_response)
             
         except Exception as e:
             print(f"Error processing example {i}: {e}")

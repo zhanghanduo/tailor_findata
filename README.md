@@ -48,11 +48,6 @@ Install the required dependencies:
 pip install -r requirements.txt
 ```
 
-Additional dependencies for training and inference on remote server for fine-tuning:
-```bash
-pip install transformers accelerate bitsandbytes unsloth
-```
-
 ### Data Processing
 
 The dataset processing script converts the ConvFinQA dataset into a format suitable for training models to generate both reasoning steps and program tokens.
@@ -139,9 +134,34 @@ python evaluate/run_inference.py \
 
 This script:
 1. Loads the fine-tuned model
-2. Prepares the test data
-3. Runs inference on each test example
-4. Saves both raw and formatted predictions for evaluation
+2. Prepares the test data with proper formatting of tables and context
+3. Applies the system prompt to guide the model to generate outputs in the expected format:
+   - Program tokens with `<begin_of_program>` and `<end_of_program>` tags
+   - Final answers with `<begin_of_answer>` and `<end_of_answer>` tags
+4. Runs inference on each test example
+5. Extracts the assistant's response and saves both raw and formatted predictions for evaluation
+
+The expected output format from the model is:
+```
+<begin_of_program>
+operation_name( number1 number2 ) EOF
+<end_of_program>
+
+<begin_of_answer>
+numerical_result
+<end_of_answer>
+```
+
+For example:
+```
+<begin_of_program>
+subtract( 120.3 85.6 ) EOF
+<end_of_program>
+
+<begin_of_answer>
+34.7
+<end_of_answer>
+```
 
 #### Post-Processing Model Outputs
 
