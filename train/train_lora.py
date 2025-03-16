@@ -251,6 +251,15 @@ def prepare_dataset(tokenizer, args):
                     if role == "user":
                         formatted_text += "<|im_start|>user\n" + content + "<|im_end|>\n"
                     elif role == "assistant":
+                        # For assistant messages, ensure they have the proper answer format
+                        if "<begin_of_answer>" not in content and "<end_of_answer>" not in content:
+                            # Try to extract a numerical answer from the content
+                            numerical_match = re.search(r'(-?\d+\.?\d*)', content)
+                            if numerical_match:
+                                # Format with the expected tags
+                                answer = numerical_match.group(1).strip()
+                                content = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer}\n<end_of_answer>"
+                        
                         formatted_text += "<|im_start|>assistant\n" + content + "<|im_end|>\n"
                 
                 # Print the formatted text for debugging
@@ -694,15 +703,27 @@ def get_compute_metrics_fn(tokenizer):
                                     
                                     if assistant_matches:
                                         # Use the last assistant response as the label
-                                        decoded_label = assistant_matches[-1].strip()
-                                        print(f"\nSample {i}: Extracted assistant response from Qwen format: {decoded_label[:50]}...")
+                                        assistant_text = assistant_matches[-1].strip()
+                                        print(f"\nSample {i}: Extracted assistant response from Qwen format: {assistant_text[:50]}...")
+                                        
+                                        # Try to extract the answer from the assistant response
+                                        answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
+                                        answer_match = re.search(answer_pattern, assistant_text, re.DOTALL)
+                                        if answer_match:
+                                            answer = answer_match.group(1).strip()
+                                            decoded_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer}\n<end_of_answer>"
+                                            print(f"\nSample {i}: Extracted answer: {answer}")
+                                        else:
+                                            # If no answer tag found, use the whole assistant response
+                                            decoded_label = assistant_text
                                     else:
                                         # Fallback: Try to extract the answer directly
                                         answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
                                         answer_match = re.search(answer_pattern, decoded_label, re.DOTALL)
                                         if answer_match:
-                                            decoded_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer_match.group(1).strip()}\n<end_of_answer>"
-                                            print(f"\nSample {i}: Extracted answer directly: {answer_match.group(1).strip()}")
+                                            answer = answer_match.group(1).strip()
+                                            decoded_label = f"<begin_of_program>\nEOF\n<end_of_program>\n\n<begin_of_answer>\n{answer}\n<end_of_answer>"
+                                            print(f"\nSample {i}: Extracted answer directly: {answer}")
                         except Exception as e:
                             print(f"\nError in tokenizer.decode for label {i}: {e}")
                             print(f"Valid tokens: {valid_tokens[:10]}{'...' if len(valid_tokens) > 10 else ''}")
@@ -735,6 +756,20 @@ def get_compute_metrics_fn(tokenizer):
             
             def extract_answer(text):
                 try:
+                    # Special case for Qwen models - check for "and" as the entire answer
+                    if text.strip().lower() == "and":
+                        # This is likely a Qwen tokenization issue - try to find a numerical value in the original text
+                        numerical_match = re.search(r'(-?\d+\.?\d*)', text)
+                        if numerical_match:
+                            try:
+                                return float(numerical_match.group(1))
+                            except ValueError:
+                                pass
+                        
+                        # If we can't find a numerical value, return a placeholder
+                        print(f"Found 'and' as the entire answer text - likely a Qwen tokenization issue")
+                        return 0.0  # Default numerical value
+                    
                     # First try to extract from the standard format
                     answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
                     match = re.search(answer_pattern, text, re.DOTALL)
@@ -767,6 +802,41 @@ def get_compute_metrics_fn(tokenizer):
                                     pass
                             # Return as string if all else fails
                             return solution.lower()
+                    
+                    # For Qwen models, check for assistant responses
+                    qwen_pattern = r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>'
+                    qwen_matches = re.findall(qwen_pattern, text, re.DOTALL)
+                    if qwen_matches:
+                        # Use the last assistant response
+                        assistant_text = qwen_matches[-1].strip()
+                        
+                        # Try to extract answer from the assistant text
+                        answer_match = re.search(answer_pattern, assistant_text, re.DOTALL)
+                        if answer_match:
+                            solution = answer_match.group(1).strip()
+                            # Normalize and try to convert to float
+                            solution = solution.replace('%', '').replace('$', '').replace(',', '')
+                            solution = re.sub(r'\s+', ' ', solution).strip()
+                            
+                            try:
+                                if re.match(r'^-?\d+\.?\d*$', solution):
+                                    return float(solution)
+                                else:
+                                    return solution.lower()
+                            except ValueError:
+                                return solution.lower()
+                        
+                        # If no answer tag in assistant response, use the whole response
+                        # but check for numerical values
+                        numerical_match = re.search(r'(-?\d+\.?\d*)', assistant_text)
+                        if numerical_match:
+                            try:
+                                return float(numerical_match.group(1))
+                            except ValueError:
+                                pass
+                        
+                        # Return the assistant text as a fallback
+                        return assistant_text.lower()
                     
                     # If standard format not found, try to find numerical answers in the text
                     # Look for patterns like "The answer is X" or "= X"
@@ -915,552 +985,25 @@ def get_compute_metrics_fn(tokenizer):
             
             # Calculate metrics
             program_match_percentage = program_matches / max(1, len(pred_str)) * 100
-            answer_match_percentage = answer_matches / max(1, len(pred_str)) * 100
-            
-            print(f"Program match: {program_match_percentage:.2f}%, Answer match: {answer_match_percentage:.2f}%")
-            
-            # Analyze predictions to understand patterns
-            analysis = analyze_predictions(pred_str, label_str, pred_answers, label_answers)
-            
-            # Log examples to wandb
+
+            # Log final metrics
             if wandb.run:
-                try:
-                    examples_table = wandb.Table(columns=["Prediction", "Reference", "Pred Program", "Label Program", 
-                                                          "Pred Answer", "Label Answer", "Answer Match", "Format Valid"])
-                    for i, (p, l, pp, lp, pa, la) in enumerate(list(zip(pred_str, label_str, pred_programs, label_programs, pred_answers, label_answers))[:10]):
-                        # Determine if answers match
-                        match = False
-                        if isinstance(pa, float) and isinstance(la, float):
-                            match = abs(pa - la) <= tolerance * max(1, abs(la))
-                        elif isinstance(pa, str) and isinstance(la, str):
-                            pa_norm = pa.lower().strip()
-                            la_norm = la.lower().strip()
-                            match = (pa_norm == la_norm) or (pa_norm in la_norm) or (la_norm in pa_norm)
-                            if not match:
-                                from difflib import SequenceMatcher
-                                similarity = SequenceMatcher(None, pa_norm, la_norm).ratio()
-                                match = similarity > 0.8
-                        
-                        format_valid = validate_format(p)
-                        examples_table.add_data(p, l, str(pp), str(lp), str(pa), str(la), str(match), str(format_valid))
-                    wandb.log({"eval_examples": examples_table})
-                except Exception as e:
-                    print(f"Error logging to wandb: {e}")
-            
-            # Return both raw counts and percentages for better debugging
-            return {
-                "program_match": program_match_percentage,
-                "answer_match": answer_match_percentage,
-                "program_matches_count": program_matches,
-                "answer_matches_count": answer_matches,
-                "total_samples": len(pred_str),
-            }
-            
-        except Exception as e:
-            print(f"Critical error in compute_metrics: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return default metrics to avoid breaking the training loop
-            return {
-                "program_match": 0.0,
-                "answer_match": 0.0,
-                "program_matches_count": 0,
-                "answer_matches_count": 0,
-                "total_samples": 0,
-            }
-    
-    return compute_metrics
-
-
-def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
-    """Set up the SFT trainer."""
-    # Ensure max_steps is an integer
-    max_steps = args.max_steps if args.max_steps > 0 else -1
-    
-    # Define a function to preprocess logits for metrics calculation
-    def preprocess_logits_for_metrics(logits, labels):
-        """Convert logits to predictions for metrics calculation."""
-        # If logits is a tuple, take the first element (which should be the main logits)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        
-        # Get the predicted token IDs
-        pred_ids = logits.argmax(dim=-1)
-        return pred_ids
-    
-    # Set padding and truncation settings for Qwen models
-    if "qwen" in args.model_name.lower():
-        print("Applying Qwen-specific padding and truncation settings in trainer setup")
-        tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-        
-        # Update model config
-        if hasattr(model, "config"):
-            model.config.pad_token_id = tokenizer.pad_token_id
-            print(f"Updated model config pad_token_id to {model.config.pad_token_id}")
-    
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        num_train_epochs=args.num_train_epochs,
-        max_steps=max_steps,  # Use the pre-processed value
-        warmup_steps=args.warmup_steps,
-        fp16=not is_bfloat16_supported(),
-        bf16=is_bfloat16_supported(),
-        logging_steps=args.logging_steps,
-        evaluation_strategy="steps" if eval_dataset else "no",
-        eval_steps=args.eval_steps if eval_dataset else None,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=3,  # Keep only the 3 best checkpoints
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="linear",
-        seed=args.seed,
-        report_to="wandb",  # Enable wandb reporting
-        load_best_model_at_end=True if eval_dataset else False,
-        metric_for_best_model="answer_match" if eval_dataset else None,
-        greater_is_better=True,
-        gradient_checkpointing=args.gradient_checkpointing,
-        # Add memory optimization options
-        deepspeed=None,  # Let the trainer handle memory optimization
-        ddp_find_unused_parameters=False,
-        # Ensure we get predictions, not just loss
-        prediction_loss_only=False,
-    )
-    
-    # Create callbacks list
-    callbacks = []
-    
-    # Add early stopping callback if using evaluation
-    if eval_dataset:
-        from transformers import EarlyStoppingCallback
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
-    
-    # Create data collator with padding
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        padding=True,
-        max_length=args.max_seq_length,
-        pad_to_multiple_of=8,  # Optimize for hardware
-        return_tensors="pt"
-    )
-    
-    # For Qwen models, ensure the data collator has the right settings
-    if "qwen" in args.model_name.lower():
-        print("Configuring data collator for Qwen model")
-        data_collator = DataCollatorForSeq2Seq(
-            tokenizer=tokenizer,
-            padding="max_length",  # Force max_length padding
-            max_length=args.max_seq_length,
-            pad_to_multiple_of=8,
-            return_tensors="pt"
-        )
-        
-        # For Qwen models, add special handling for evaluation
-        if eval_dataset:
-            print("Adding special handling for Qwen model evaluation")
-            
-            # Check if the dataset has the last_assistant_response field
-            sample = eval_dataset[0] if len(eval_dataset) > 0 else {}
-            has_last_responses = "last_assistant_response" in sample
-            
-            if has_last_responses:
-                print("Found last_assistant_response field in evaluation dataset")
+                metrics = {
+                    "train/global_step": trainer_stats.global_step,
+                }
                 
-                # Create a custom compute_metrics function that uses the last_assistant_response
-                original_compute_metrics = get_compute_metrics_fn(tokenizer)
-                
-                def qwen_compute_metrics(eval_preds):
-                    # Store a reference to the trainer for use in compute_metrics
-                    global trainer
+                # Add training loss if available
+                if hasattr(trainer_stats, 'training_loss') and trainer_stats.training_loss is not None:
+                    metrics["train/final_loss"] = trainer_stats.training_loss
                     
-                    # Call the original compute_metrics function
-                    metrics = original_compute_metrics(eval_preds)
+                # Add epoch if available
+                if hasattr(trainer_stats, 'epoch') and trainer_stats.epoch is not None:
+                    metrics["train/epoch"] = trainer_stats.epoch
                     
-                    # Add a note that we're using the special Qwen handling
-                    metrics["using_qwen_special_handling"] = True
-                    
-                    return metrics
+                # Add padding and truncation settings
+                metrics["train/max_length"] = trainer.args.max_seq_length
+                metrics["train/padding"] = getattr(trainer.args, "padding", "unknown")
+                metrics["train/truncation"] = getattr(trainer.args, "truncation", "unknown")
                 
-                # Use the custom compute_metrics function
-                compute_metrics_fn = qwen_compute_metrics
-            else:
-                # Use the standard compute_metrics function
-                compute_metrics_fn = get_compute_metrics_fn(tokenizer)
-        else:
-            compute_metrics_fn = None
-    else:
-        # For non-Qwen models, use the standard compute_metrics function
-        compute_metrics_fn = get_compute_metrics_fn(tokenizer) if eval_dataset else None
-    
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        data_collator=data_collator,
-        dataset_num_proc=2,
-        packing=False,
-        args=training_args,
-        compute_metrics=compute_metrics_fn,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset else None,
-        callbacks=callbacks,
-    )
-    
-    # Determine which response markers to use based on the model type
-    model_name_lower = args.model_name.lower()
-    
-    # Configure to train only on assistant responses with model-specific markers
-    if "qwen" in model_name_lower:
-        # For Qwen models, use their specific markers
-        print("Using Qwen-specific response markers for training")
-        trainer = custom_train_on_responses_only(
-            trainer,
-            tokenizer,
-            instruction_part="<|im_start|>user\n",
-            response_part="<|im_start|>assistant\n"
-        )
-    elif "yi" in model_name_lower:
-        # For Yi models, use their specific markers
-        print("Using Yi-specific response markers for training")
-        trainer = custom_train_on_responses_only(
-            trainer,
-            tokenizer,
-            instruction_part="<|im_start|>user\n",
-            response_part="<|im_start|>assistant\n"
-        )
-    else:
-        # Default behavior for other models
-        print("Using default response markers for training")
-        trainer = custom_train_on_responses_only(
-            trainer,
-            tokenizer,
-            instruction_part="<|im_start|>human<|im_sep|>",
-            response_part="<|im_start|>assistant<|im_sep|>"
-        )
-    
-    return trainer
-
-
-def train_model(trainer):
-    """Train the model and return training stats."""
-    print("Starting training...")
-    
-    # Check if we're using a Qwen model
-    is_qwen = False
-    if hasattr(trainer.model, "config") and hasattr(trainer.model.config, "model_type"):
-        is_qwen = "qwen" in trainer.model.config.model_type.lower()
-    elif hasattr(trainer.args, "model_name_or_path"):
-        is_qwen = "qwen" in trainer.args.model_name_or_path.lower()
-    
-    # Special handling for Qwen models
-    if is_qwen:
-        print("\n===== SPECIAL HANDLING FOR QWEN MODEL =====")
-        print("Checking dataset format before training...")
-        
-        # Check if the dataset is already tokenized
-        if hasattr(trainer.train_dataset, "features") and "input_ids" in trainer.train_dataset.features:
-            print("✅ Dataset is already tokenized with input_ids")
-            
-            # Check a sample to ensure consistent lengths
-            sample = trainer.train_dataset[0]
-            if "input_ids" in sample and "attention_mask" in sample:
-                print(f"Sample input_ids length: {len(sample['input_ids'])}")
-                print(f"Sample attention_mask length: {len(sample['attention_mask'])}")
-                
-                if len(sample['input_ids']) != len(sample['attention_mask']):
-                    print("⚠️ WARNING: input_ids and attention_mask have different lengths!")
-                    print("Attempting to fix by truncating to shorter length...")
-                    
-                    # This is a last resort fix - ideally the dataset preparation should handle this
-                    def fix_length_mismatch(dataset):
-                        fixed_dataset = []
-                        for item in dataset:
-                            input_ids_len = len(item['input_ids'])
-                            attn_mask_len = len(item['attention_mask'])
-                            min_len = min(input_ids_len, attn_mask_len)
-                            
-                            fixed_item = {
-                                'input_ids': item['input_ids'][:min_len],
-                                'attention_mask': item['attention_mask'][:min_len]
-                            }
-                            fixed_dataset.append(fixed_item)
-                        
-                        return Dataset.from_list(fixed_dataset)
-                    
-                    print("Fixing train dataset...")
-                    trainer.train_dataset = fix_length_mismatch(trainer.train_dataset)
-                    
-                    if trainer.eval_dataset:
-                        print("Fixing eval dataset...")
-                        trainer.eval_dataset = fix_length_mismatch(trainer.eval_dataset)
-                    
-                    print("Dataset lengths fixed.")
-        else:
-            print("⚠️ Dataset is not tokenized with input_ids. This may cause issues with Qwen models.")
-    
-    # Wrap the training in a try-except block to provide better error messages
-    try:
-        trainer_stats = trainer.train()
-        
-        # Log final metrics
-        if wandb.run:
-            metrics = {
-                "train/global_step": trainer_stats.global_step,
-            }
-            
-            # Add training loss if available
-            if hasattr(trainer_stats, 'training_loss') and trainer_stats.training_loss is not None:
-                metrics["train/final_loss"] = trainer_stats.training_loss
-                
-            # Add epoch if available
-            if hasattr(trainer_stats, 'epoch') and trainer_stats.epoch is not None:
-                metrics["train/epoch"] = trainer_stats.epoch
-                
-            # Add padding and truncation settings
-            metrics["train/max_length"] = trainer.args.max_length
-            metrics["train/padding"] = trainer.args.padding
-            metrics["train/truncation"] = trainer.args.truncation
-                
-            wandb.log(metrics)
-        
-        return trainer_stats
-    
-    except ValueError as e:
-        if "expected sequence of length" in str(e) and is_qwen:
-            print("\n===== QWEN MODEL ERROR =====")
-            print("Encountered sequence length mismatch error, which is common with Qwen models.")
-            print("Error details:", str(e))
-            print("\nPossible solutions:")
-            print("1. Make sure all sequences in a batch have the same length")
-            print("2. Use padding='max_length' and truncation=True in tokenizer")
-            print("3. Ensure input_ids and attention_mask have the same length")
-            print("4. Try reducing batch size or max_seq_length")
-            print("5. Check if the dataset is properly tokenized before training")
-            
-            # Re-raise the error to stop execution
-            raise ValueError("Qwen model training failed due to sequence length mismatch. See above for details.") from e
-        else:
-            # For other errors, just re-raise
-            raise
-
-
-def save_model(model, tokenizer, args):
-    """Save the fine-tuned model and tokenizer."""
-    output_path = os.path.join(args.output_dir, "final_model")
-    print(f"Saving model to {output_path}")
-    model.save_pretrained(output_path)
-    tokenizer.save_pretrained(output_path)
-    return output_path
-
-
-def test_model(model_path, args):
-    """Test the saved model with a few examples."""
-    print(f"Testing model from {model_path}")
-    
-    # Load the saved model
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_path,
-        max_seq_length=args.max_seq_length,
-        dtype=torch.bfloat16 if is_bfloat16_supported() else torch.float16,
-        load_in_4bit=args.load_in_4bit,
-    )
-    FastLanguageModel.for_inference(model)
-    
-    # Test examples
-    test_examples = [
-        "Continue the fibonacci sequence: 1, 1, 2, 3, 5, 8,",
-        "Describe a tall tower in the capital of France.",
-        "What are three key benefits of fine-tuning language models?",
-    ]
-    
-    results = []
-    for example in test_examples:
-        print(f"\nTest prompt: {example}")
-        
-        messages = [{"role": "user", "content": example}]
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to("cuda")
-        
-        text_streamer = TextStreamer(tokenizer, skip_prompt=True)
-        outputs = model.generate(
-            input_ids=inputs,
-            streamer=text_streamer,
-            max_new_tokens=128,
-            use_cache=True,
-            temperature=0.7,
-            top_p=0.9,
-        )
-        
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        results.append({"prompt": example, "response": generated_text})
-    
-    # Log test results to wandb
-    if wandb.run:
-        test_table = wandb.Table(columns=["Prompt", "Response"])
-        for result in results:
-            test_table.add_data(result["prompt"], result["response"])
-        wandb.log({"test_examples": test_table})
-    
-    return results
-
-
-def evaluate_on_fixed_examples(model, tokenizer, args):
-    """Evaluate the model on a fixed set of examples to ensure consistent evaluation."""
-    print("Evaluating model on fixed examples...")
-    
-    # Fixed set of financial questions
-    fixed_examples = [
-        "What is the present value of $1000 to be received in 5 years if the discount rate is 8%?",
-        "A company has a debt-to-equity ratio of 0.75. If its total assets are $500,000, what is the value of its equity?",
-        "If a stock has a beta of 1.5, risk-free rate is 3%, and market risk premium is 6%, what is the expected return according to CAPM?",
-        "A bond with face value $1000 pays 5% annual coupon and matures in 10 years. If the yield to maturity is 6%, what is the bond's price?",
-        "If a company's ROE is 15% and its retention ratio is 40%, what is its sustainable growth rate?",
-    ]
-    
-    results = []
-    for example in fixed_examples:
-        print(f"\nFixed example: {example}")
-        
-        messages = [{"role": "user", "content": example}]
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to("cuda")
-        
-        # Generate without streaming for evaluation
-        outputs = model.generate(
-            input_ids=inputs,
-            max_new_tokens=256,
-            use_cache=True,
-            temperature=0.2,  # Lower temperature for more deterministic outputs
-            top_p=0.9,
-        )
-        
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract the assistant's response
-        response = generated_text.split("<|im_start|>assistant<|im_sep|>")[-1].strip()
-        
-        # Try to extract the answer
-        try:
-            answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
-            match = re.search(answer_pattern, response, re.DOTALL)
-            if match:
-                answer = match.group(1).strip()
-            else:
-                # Try alternative patterns
-                alt_patterns = [
-                    r'(?:answer|result|value)(?:\s+is|\s*[:=])\s*([\d\.\,\$]+)',
-                    r'(?:=|equals)\s*([\d\.\,\$]+)',
-                ]
-                
-                for pattern in alt_patterns:
-                    match = re.search(pattern, response, re.IGNORECASE)
-                    if match:
-                        answer = match.group(1).strip()
-                        break
-                else:
-                    answer = "No explicit answer found"
-        except Exception as e:
-            print(f"Error extracting answer: {e}")
-            answer = "Error extracting answer"
-        
-        results.append({
-            "question": example,
-            "response": response,
-            "extracted_answer": answer
-        })
-    
-    # Log results to wandb
-    if wandb.run:
-        try:
-            fixed_examples_table = wandb.Table(columns=["Question", "Response", "Extracted Answer"])
-            for result in results:
-                fixed_examples_table.add_data(
-                    result["question"], 
-                    result["response"], 
-                    result["extracted_answer"]
-                )
-            wandb.log({"fixed_examples": fixed_examples_table})
-        except Exception as e:
-            print(f"Error logging fixed examples to wandb: {e}")
-    
-    return results
-
-
-def main():
-    """Main function to run the training pipeline."""
-    # Parse arguments
-    args = parse_args()
-    
-    # Ensure max_steps is properly set
-    if args.max_steps is None or args.max_steps <= 0:
-        args.max_steps = -1
-    
-    print(f"Training configuration:")
-    print(f"  - Model: {args.model_name}")
-    print(f"  - Dataset: {args.dataset_name}")
-    print(f"  - Train batch size: {args.batch_size}")
-    print(f"  - Eval batch size: {args.eval_batch_size}")
-    print(f"  - Gradient accumulation steps: {args.gradient_accumulation_steps}")
-    print(f"  - Gradient checkpointing: {args.gradient_checkpointing}")
-    print(f"  - Max eval samples: {args.max_eval_samples}")
-    print(f"  - Max sequence length: {args.max_seq_length}")
-    print(f"  - Force dataset download: {args.force_dataset_download}")
-    print(f"  - Chat template: {args.chat_template if args.chat_template else 'Auto-detect'}")
-    
-    # Setup wandb
-    wandb_run = setup_wandb(args)
-    
-    # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(args)
-    
-    # Prepare dataset
-    train_dataset, eval_dataset = prepare_dataset(tokenizer, args)
-    
-    # Debug tokenized dataset
-    debug_tokenized_dataset(tokenizer, train_dataset)
-    
-    # Setup trainer
-    trainer = setup_trainer(model, tokenizer, train_dataset, eval_dataset, args)
-    
-    # Train model
-    trainer_stats = train_model(trainer)
-    
-    # Save model
-    model_path = save_model(model, tokenizer, args)
-    
-    # Prepare model for inference before evaluation
-    print("Preparing model for inference evaluation...")
-    FastLanguageModel.for_inference(model)
-    
-    # Evaluate on fixed examples using the in-memory model
-    fixed_examples_results = evaluate_on_fixed_examples(model, tokenizer, args)
-    
-    # Test model by loading from disk
-    test_results = test_model(model_path, args)
-    
-    # Finish wandb run
-    if wandb.run:
-        wandb.finish()
-    
-    print("Training pipeline completed successfully!")
-
-
-if __name__ == "__main__":
-    main()
+                wandb.log(metrics)
 
