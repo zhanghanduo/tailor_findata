@@ -951,7 +951,6 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
             padding="max_length",  # Force max_length padding
             max_length=args.max_seq_length,
             pad_to_multiple_of=8,
-            truncation=True,  # Ensure truncation is enabled
             return_tensors="pt"
         )
     
