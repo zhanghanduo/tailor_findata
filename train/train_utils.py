@@ -221,101 +221,184 @@ def custom_train_on_responses_only(trainer, tokenizer, instruction_part, respons
     # Get the original dataset
     dataset = trainer.train_dataset
     
-    # Function to process a single example
-    def process_example(example):
-        text = example["text"]
+    # Check if the dataset is already tokenized
+    sample = dataset[0] if len(dataset) > 0 else {}
+    is_tokenized = "input_ids" in sample and "text" not in sample
+    
+    if is_tokenized:
+        print("Dataset is already tokenized. Applying response-only training directly on tokenized data.")
         
-        # Find the positions of markers
-        instruction_pos = text.find(instruction_part)
-        response_pos = text.find(response_part, instruction_pos + len(instruction_part) if instruction_pos >= 0 else 0)
+        # For tokenized datasets, we need to find the token IDs for the markers
+        instruction_tokens = tokenizer.encode(instruction_part, add_special_tokens=False)
+        response_tokens = tokenizer.encode(response_part, add_special_tokens=False)
         
-        # If we can't find the markers, return the original
-        if instruction_pos < 0 or response_pos < 0:
-            print(f"Warning: Could not find markers in text: {text[:100]}...")
-            return example
+        print(f"Instruction token IDs: {instruction_tokens}")
+        print(f"Response token IDs: {response_tokens}")
         
-        # Tokenize the full text
-        tokenized = tokenizer(text, return_tensors="pt")
-        input_ids = tokenized["input_ids"][0]
-        
-        # Find token indices for the markers
-        full_text_tokens = tokenizer.encode(text)
-        instruction_tokens = tokenizer.encode(instruction_part)
-        response_tokens = tokenizer.encode(response_part)
-        
-        # Find the position of instruction and response in the tokenized text
-        instruction_token_pos = -1
-        response_token_pos = -1
-        
-        # Simple search for the instruction tokens
-        for i in range(len(full_text_tokens) - len(instruction_tokens) + 1):
-            if full_text_tokens[i:i+len(instruction_tokens)] == instruction_tokens:
-                instruction_token_pos = i
-                break
-        
-        # Search for response tokens after the instruction
-        if instruction_token_pos >= 0:
-            for i in range(instruction_token_pos + len(instruction_tokens), len(full_text_tokens) - len(response_tokens) + 1):
-                if full_text_tokens[i:i+len(response_tokens)] == response_tokens:
+        # Function to process a tokenized example
+        def process_tokenized_example(example):
+            input_ids = example["input_ids"]
+            if isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids.tolist()
+            
+            attention_mask = example["attention_mask"] if "attention_mask" in example else [1] * len(input_ids)
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = attention_mask.tolist()
+            
+            # Find the position of the response tokens in the input_ids
+            response_token_pos = -1
+            
+            # Search for response tokens
+            for i in range(len(input_ids) - len(response_tokens) + 1):
+                if input_ids[i:i+len(response_tokens)] == response_tokens:
                     response_token_pos = i
                     break
+            
+            # Create labels: -100 for non-response tokens, actual token IDs for response tokens
+            labels = [-100] * len(input_ids)
+            
+            # Set labels for the response part
+            if response_token_pos >= 0:
+                for i in range(response_token_pos, len(input_ids)):
+                    labels[i] = input_ids[i]
+            
+            # Check if we have any non-masked labels
+            if all(label == -100 for label in labels):
+                print(f"Warning: All labels are masked for this example!")
+                # Try a fallback approach - look for any occurrence of the first token of response_tokens
+                if len(response_tokens) > 0:
+                    for i, token_id in enumerate(input_ids):
+                        if token_id == response_tokens[0]:
+                            # Found a potential match, check if it's followed by the rest of response_tokens
+                            if i + len(response_tokens) <= len(input_ids) and input_ids[i:i+len(response_tokens)] == response_tokens:
+                                print(f"Found response marker at position {i} using fallback method")
+                                for j in range(i, len(input_ids)):
+                                    labels[j] = input_ids[j]
+                                break
+            
+            return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
         
-        # If we couldn't find the token positions, use a different approach
-        if instruction_token_pos < 0 or response_token_pos < 0:
-            print(f"Warning: Could not find token positions for markers. Using text positions instead.")
-            # Tokenize the text up to the response part
-            prefix_text = text[:response_pos]
-            prefix_tokens = tokenizer.encode(prefix_text)
-            response_token_pos = len(prefix_tokens)
+        # Process the dataset
+        processed_dataset = dataset.map(
+            process_tokenized_example,
+            batched=False,
+            desc="Applying response-only training to tokenized dataset"
+        )
         
-        # Create labels: -100 for non-response tokens, actual token IDs for response tokens
-        labels = [-100] * len(input_ids)
+        # Update the trainer with the processed dataset
+        trainer.train_dataset = processed_dataset
         
-        # Set labels for the response part
-        if response_token_pos >= 0:
-            for i in range(response_token_pos, len(input_ids)):
-                labels[i] = input_ids[i].item()
+        # Process a few examples for debugging
+        print("\nProcessing a few examples for debugging:")
+        for i in range(min(2, len(processed_dataset))):
+            example = processed_dataset[i]
+            
+            # Check if we have any non-masked labels
+            if "labels" in example and all(label == -100 for label in example["labels"]):
+                print(f"Example {i}: All labels are masked!")
+            else:
+                print(f"Example {i}: Labels contain non-masked values")
+                # Count non-masked labels
+                non_masked = sum(1 for label in example["labels"] if label != -100)
+                print(f"  - Non-masked labels: {non_masked} out of {len(example['labels'])}")
+    else:
+        # Function to process a single example with text
+        def process_example(example):
+            if "text" not in example:
+                print(f"Warning: Example does not have 'text' field. Available keys: {list(example.keys())}")
+                # If we have input_ids but no text, use the tokenized processing
+                if "input_ids" in example:
+                    return process_tokenized_example(example)
+                return example
+                
+            text = example["text"]
+            
+            # Find the positions of markers
+            instruction_pos = text.find(instruction_part)
+            response_pos = text.find(response_part, instruction_pos + len(instruction_part) if instruction_pos >= 0 else 0)
+            
+            # If we can't find the markers, return the original
+            if instruction_pos < 0 or response_pos < 0:
+                print(f"Warning: Could not find markers in text: {text[:100]}...")
+                return example
+            
+            # Tokenize the full text
+            tokenized = tokenizer(text, return_tensors="pt")
+            input_ids = tokenized["input_ids"][0]
+            
+            # Find token indices for the markers
+            full_text_tokens = tokenizer.encode(text)
+            instruction_tokens = tokenizer.encode(instruction_part)
+            response_tokens = tokenizer.encode(response_part)
+            
+            # Find the position of instruction and response in the tokenized text
+            instruction_token_pos = -1
+            response_token_pos = -1
+            
+            # Simple search for the instruction tokens
+            for i in range(len(full_text_tokens) - len(instruction_tokens) + 1):
+                if full_text_tokens[i:i+len(instruction_tokens)] == instruction_tokens:
+                    instruction_token_pos = i
+                    break
+            
+            # Search for response tokens after the instruction
+            if instruction_token_pos >= 0:
+                for i in range(instruction_token_pos + len(instruction_tokens), len(full_text_tokens) - len(response_tokens) + 1):
+                    if full_text_tokens[i:i+len(response_tokens)] == response_tokens:
+                        response_token_pos = i
+                        break
+            
+            # If we couldn't find the token positions, use a different approach
+            if instruction_token_pos < 0 or response_token_pos < 0:
+                print(f"Warning: Could not find token positions for markers. Using text positions instead.")
+                # Tokenize the text up to the response part
+                prefix_text = text[:response_pos]
+                prefix_tokens = tokenizer.encode(prefix_text)
+                response_token_pos = len(prefix_tokens)
+            
+            # Create labels: -100 for non-response tokens, actual token IDs for response tokens
+            labels = [-100] * len(input_ids)
+            
+            # Set labels for the response part
+            if response_token_pos >= 0:
+                for i in range(response_token_pos, len(input_ids)):
+                    labels[i] = input_ids[i].item()
+            
+            # Check if we have any non-masked labels
+            if all(label == -100 for label in labels):
+                print(f"Warning: All labels are masked for this example!")
+                # Print some debug info
+                print(f"Text: {text[:100]}...")
+                print(f"Instruction pos: {instruction_pos}, Response pos: {response_pos}")
+                print(f"Instruction token pos: {instruction_token_pos}, Response token pos: {response_token_pos}")
+            
+            return {"input_ids": input_ids, "labels": labels, "attention_mask": tokenized["attention_mask"][0]}
         
-        # Check if we have any non-masked labels
-        if all(label == -100 for label in labels):
-            print(f"Warning: All labels are masked for this example!")
-            # Print some debug info
-            print(f"Text: {text[:100]}...")
-            print(f"Instruction pos: {instruction_pos}, Response pos: {response_pos}")
-            print(f"Instruction token pos: {instruction_token_pos}, Response token pos: {response_token_pos}")
+        # Process the dataset
+        processed_dataset = dataset.map(
+            process_example,
+            batched=False,
+            desc="Applying response-only training"
+        )
         
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": tokenized["attention_mask"][0]}
+        # Update the trainer with the processed dataset
+        trainer.train_dataset = processed_dataset
+        
+        # Process a few examples for debugging
+        print("\nProcessing a few examples for debugging:")
+        for i in range(min(2, len(processed_dataset))):
+            example = processed_dataset[i]
+            
+            # Check if we have any non-masked labels
+            if "labels" in example and all(label == -100 for label in example["labels"]):
+                print(f"Example {i}: All labels are masked!")
+            else:
+                print(f"Example {i}: Labels contain non-masked values")
+                # Count non-masked labels
+                non_masked = sum(1 for label in example["labels"] if label != -100)
+                print(f"  - Non-masked labels: {non_masked} out of {len(example['labels'])}")
     
-    # Process a few examples for debugging
-    print("\nProcessing a few examples for debugging:")
-    for i in range(min(2, len(dataset))):
-        example = dataset[i]
-        processed = process_example(example)
-        
-        # Check if we have any non-masked labels
-        if "labels" in processed and all(label == -100 for label in processed["labels"]):
-            print(f"Example {i}: All labels are masked!")
-        else:
-            print(f"Example {i}: Labels contain non-masked values")
-    
-    # Create a new dataset with the processed examples
-    # Process all examples
-    processed_examples = []
-    for i, example in enumerate(dataset):
-        processed = process_example(example)
-        processed_examples.append(processed)
-    
-    # Create a new dataset
-    processed_dataset = Dataset.from_dict({
-        "input_ids": [ex["input_ids"] for ex in processed_examples],
-        "labels": [ex["labels"] for ex in processed_examples],
-        "attention_mask": [ex["attention_mask"] for ex in processed_examples]
-    })
-    
-    # Replace the trainer's dataset
-    trainer.train_dataset = processed_dataset
-    
-    print(f"===== CUSTOM TRAIN_ON_RESPONSES_ONLY APPLIED =====\n")
+    print("===== CUSTOM TRAIN_ON_RESPONSES_ONLY APPLIED =====\n")
     return trainer
 
 
