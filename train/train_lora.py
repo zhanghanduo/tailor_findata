@@ -15,60 +15,15 @@ from transformers import (
     EvalPrediction
 )
 import torch
+from train_utils import (
+    apply_custom_chat_template,
+    validate_format,
+    debug_tokenized_dataset,
+    custom_train_on_responses_only
+)
 
 
-def apply_custom_chat_template(tokenizer, chat_template_name):
-    """
-    Apply custom chat templates for models that might not be directly supported by unsloth.
-    
-    Args:
-        tokenizer: The tokenizer to modify
-        chat_template_name: The name of the chat template to apply
-        
-    Returns:
-        The modified tokenizer with the custom chat template
-    """
-    # Qwen2.5 chat template
-    if chat_template_name.lower() == "qwen":
-        # Qwen2.5 uses a specific chat template format
-        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}<|im_start|>system
-{{ message['content'] }}<|im_end|>
-{% elif message['role'] == 'user' %}<|im_start|>user
-{{ message['content'] }}<|im_end|>
-{% elif message['role'] == 'assistant' %}<|im_start|>assistant
-{{ message['content'] }}<|im_end|>
-{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"""
-        tokenizer.chat_template = chat_template
-        print(f"Applied custom Qwen chat template")
-        return tokenizer
-    
-    # Yi chat template
-    elif chat_template_name.lower() == "yi":
-        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}<|im_start|>system
-{{ message['content'] }}<|im_end|>
-{% elif message['role'] == 'user' %}<|im_start|>user
-{{ message['content'] }}<|im_end|>
-{% elif message['role'] == 'assistant' %}<|im_start|>assistant
-{{ message['content'] }}<|im_end|>
-{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
-{% endif %}"""
-        tokenizer.chat_template = chat_template
-        print(f"Applied custom Yi chat template")
-        return tokenizer
-    
-    # Claude chat template
-    elif chat_template_name.lower() == "claude":
-        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}
-{% elif message['role'] == 'user' %}Human: {{ message['content'] }}
-{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}
-{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"""
-        tokenizer.chat_template = chat_template
-        print(f"Applied custom Claude chat template")
-        return tokenizer
-    
-    # Return None if no custom template was applied
-    return None
+
 
 
 system_prompt = """Your role is to solve financial questions by generating both the program tokens that represent the calculation and the final answer. 
@@ -179,53 +134,7 @@ def setup_wandb(args):
     return wandb.run
 
 
-def validate_format(text):
-    """Validate that the text follows the expected format."""
-    # Check for program tokens format
-    program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
-    program_match = re.search(program_pattern, text, re.DOTALL)
-    
-    # Check for answer format
-    answer_pattern = r'<begin_of_answer>\s*(.*?)\s*<end_of_answer>'
-    answer_match = re.search(answer_pattern, text, re.DOTALL)
-    
-    # Basic validation
-    is_valid = program_match is not None and answer_match is not None
-    
-    # Check for common formatting issues in program tokens
-    if program_match:
-        program_text = program_match.group(1).strip()
-        tokens = program_text.split()
-        
-        # Check for reference numbers without #
-        for i, token in enumerate(tokens):
-            if i > 0 and token.isdigit() and tokens[i-1].endswith("("):
-                # This might be a reference number without #
-                is_valid = False
-                break
-    
-    # Check for common formatting issues in answers
-    if answer_match and is_valid:
-        answer_text = answer_match.group(1).strip()
-        
-        # Check for line breaks in the answer
-        if '\n' in answer_text:
-            is_valid = False
-        
-        # Check for multiple spaces in the answer
-        if '  ' in answer_text:
-            is_valid = False
-        
-        # Check for invalid numerical format (should be a clean number)
-        # Valid formats: 123, 123.45, -123, -123.45
-        if not re.match(r'^-?\d+\.?\d*$', answer_text):
-            # Allow for some common formatting that can be normalized
-            # e.g., with currency symbols or commas
-            normalized = answer_text.replace('$', '').replace(',', '').replace('%', '')
-            if not re.match(r'^-?\d+\.?\d*$', normalized):
-                is_valid = False
-    
-    return is_valid
+
 
 
 def load_model_and_tokenizer(args):
@@ -320,14 +229,44 @@ def prepare_dataset(tokenizer, args):
 
         texts = []
         for convo, sys_prompt in zip(convos, system_prompts):
-            # Apply the chat template with the system prompt as a separate parameter
-            formatted_text = tokenizer.apply_chat_template(
-                convo, 
-                tokenize=False, 
-                add_generation_prompt=False,
-                system_message=system_prompt
-            )
-            texts.append(formatted_text)
+            # Check if we're using a Qwen model
+            is_qwen = "qwen" in args.model_name.lower()
+            
+            # For Qwen models, ensure the conversation format is correct
+            if is_qwen:
+                # Print debug info for the first few examples
+                if len(texts) < 2:
+                    print(f"\nFormatting example for Qwen model:")
+                    print(f"System prompt: {sys_prompt}")
+                    print(f"Conversation: {convo[:2]}")  # Show first 2 messages
+                
+                # Ensure the conversation has the right format
+                formatted_text = "<|im_start|>system\n" + sys_prompt + "<|im_end|>\n"
+                
+                for message in convo:
+                    role = message["role"]
+                    content = message["content"]
+                    
+                    if role == "user":
+                        formatted_text += "<|im_start|>user\n" + content + "<|im_end|>\n"
+                    elif role == "assistant":
+                        formatted_text += "<|im_start|>assistant\n" + content + "<|im_end|>\n"
+                
+                # Print the formatted text for debugging
+                if len(texts) < 2:
+                    print(f"Formatted text (first 200 chars): {formatted_text[:200]}...")
+                
+                texts.append(formatted_text)
+            else:
+                # For other models, use the standard chat template
+                formatted_text = tokenizer.apply_chat_template(
+                    convo, 
+                    tokenize=False, 
+                    add_generation_prompt=False,
+                    system_message=sys_prompt
+                )
+                texts.append(formatted_text)
+        
         return {"text": texts}
     
     # Load dataset
@@ -387,6 +326,15 @@ def prepare_dataset(tokenizer, args):
         print(f"Eval dataset size: {len(eval_dataset)}")
 
     return train_dataset, eval_dataset
+
+
+
+
+
+
+    
+    print(f"===== CUSTOM TRAIN_ON_RESPONSES_ONLY APPLIED =====\n")
+    return trainer
 
 
 def analyze_predictions(pred_str, label_str, pred_answers, label_answers, step=None):
@@ -951,24 +899,27 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     if "qwen" in model_name_lower:
         # For Qwen models, use their specific markers
         print("Using Qwen-specific response markers for training")
-        trainer = train_on_responses_only(
+        trainer = custom_train_on_responses_only(
             trainer,
-            instruction_part="<|im_start|>user<|im_end|>",
-            response_part="<|im_start|>assistant<|im_end|>"
+            tokenizer,
+            instruction_part="<|im_start|>user\n",
+            response_part="<|im_start|>assistant\n"
         )
     elif "yi" in model_name_lower:
         # For Yi models, use their specific markers
         print("Using Yi-specific response markers for training")
-        trainer = train_on_responses_only(
+        trainer = custom_train_on_responses_only(
             trainer,
-            instruction_part="<|im_start|>user<|im_end|>",
-            response_part="<|im_start|>assistant<|im_end|>"
+            tokenizer,
+            instruction_part="<|im_start|>user\n",
+            response_part="<|im_start|>assistant\n"
         )
     else:
         # Default behavior for other models
         print("Using default response markers for training")
-        trainer = train_on_responses_only(
+        trainer = custom_train_on_responses_only(
             trainer,
+            tokenizer,
             instruction_part="<|im_start|>human<|im_sep|>",
             response_part="<|im_start|>assistant<|im_sep|>"
         )
@@ -1179,6 +1130,9 @@ def main():
     
     # Prepare dataset
     train_dataset, eval_dataset = prepare_dataset(tokenizer, args)
+    
+    # Debug tokenized dataset
+    debug_tokenized_dataset(tokenizer, train_dataset)
     
     # Setup trainer
     trainer = setup_trainer(model, tokenizer, train_dataset, eval_dataset, args)
