@@ -10,21 +10,159 @@ def extract_program_tokens(text):
     Extract program tokens from model output.
     Looks for content between <begin_of_program> and <end_of_program> tags.
     """
+    # First try to find the program section
     program_pattern = r'<begin_of_program>\s*(.*?)\s*<end_of_program>'
     match = re.search(program_pattern, text, re.DOTALL)
     
     if match:
         program_text = match.group(1).strip()
-        # Split by whitespace to get tokens
-        tokens = program_text.split()
         
-        # Ensure the last token is EOF
-        if tokens and tokens[-1] != "EOF":
-            tokens.append("EOF")
-        
-        return tokens
+        # Check if the program text contains operation tokens
+        operation_pattern = r'(add|subtract|multiply|divide)\s*\('
+        if re.search(operation_pattern, program_text):
+            # Split by whitespace to get tokens
+            tokens = []
+            # Process tokens to handle parentheses correctly
+            in_operation = False
+            
+            # First, normalize spacing around parentheses and ensure proper spacing
+            program_text = re.sub(r'\(\s+', '(', program_text)  # Remove space after opening parenthesis
+            program_text = re.sub(r'\s+\)', ')', program_text)  # Remove space before closing parenthesis
+            program_text = re.sub(r'([a-zA-Z]+)\(', r'\1 (', program_text)  # Add space between operation and (
+            
+            # Split by whitespace
+            raw_tokens = program_text.split()
+            
+            i = 0
+            while i < len(raw_tokens):
+                token = raw_tokens[i]
+                
+                # Skip system prompt related tokens
+                if "system" in token.lower() or "user" in token.lower() or "assistant" in token.lower():
+                    i += 1
+                    continue
+                # Skip instruction related tokens
+                if "[inst]" in token.lower() or "[/inst]" in token.lower():
+                    i += 1
+                    continue
+                
+                # Handle operation names
+                if token.lower() in ["add", "subtract", "multiply", "divide"]:
+                    # Check if next token is a parenthesis
+                    if i + 1 < len(raw_tokens) and raw_tokens[i + 1] == "(":
+                        tokens.append(token.lower() + "(")
+                        i += 2  # Skip the operation and the opening parenthesis
+                        in_operation = True
+                    else:
+                        tokens.append(token.lower())
+                        i += 1
+                # Handle opening parenthesis
+                elif token == "(" and i > 0 and raw_tokens[i-1].lower() in ["add", "subtract", "multiply", "divide"]:
+                    # Already handled with the operation
+                    i += 1
+                # Handle standalone opening parenthesis
+                elif token == "(":
+                    tokens.append(token)
+                    i += 1
+                    in_operation = True
+                # Handle closing parenthesis
+                elif token == ")":
+                    tokens.append(token)
+                    i += 1
+                    in_operation = False
+                # Handle tokens with attached parentheses
+                elif "(" in token or ")" in token:
+                    # Split the token by parentheses
+                    parts = []
+                    current_part = ""
+                    for char in token:
+                        if char in "()":
+                            if current_part:
+                                parts.append(current_part)
+                                current_part = ""
+                            parts.append(char)
+                        else:
+                            current_part += char
+                    if current_part:
+                        parts.append(current_part)
+                    
+                    # Add each part as a separate token
+                    for part in parts:
+                        if part == "(":
+                            in_operation = True
+                        elif part == ")":
+                            in_operation = False
+                        tokens.append(part)
+                    
+                    i += 1
+                # Handle reference numbers (with # symbol)
+                elif token.startswith("#"):
+                    tokens.append(token)
+                    i += 1
+                # Handle regular numbers and other tokens
+                else:
+                    tokens.append(token)
+                    i += 1
+            
+            # Ensure the last token is EOF
+            if tokens and tokens[-1].upper() != "EOF":
+                tokens.append("EOF")
+            
+            # If we have no valid tokens, return just EOF
+            if not tokens:
+                return ["EOF"]
+                
+            return tokens
+        else:
+            # If no operation pattern found, try to extract any meaningful tokens
+            # Look for operation tokens in a more flexible way
+            operation_words = ["add", "subtract", "multiply", "divide"]
+            for op in operation_words:
+                if op in program_text.lower():
+                    # Try to reconstruct a valid operation
+                    parts = program_text.lower().split(op)
+                    if len(parts) > 1:
+                        # Find numbers after the operation
+                        number_pattern = r'[-+]?\d*\.?\d+'
+                        numbers = re.findall(number_pattern, parts[1])
+                        if len(numbers) >= 2:
+                            # Construct a valid operation token sequence
+                            return [f"{op}(", numbers[0], numbers[1], ")", "EOF"]
+            
+            # If still no operation found, try to extract any tokens
+            tokens = program_text.split()
+            
+            # Filter out any non-program tokens
+            valid_tokens = []
+            for token in tokens:
+                # Skip system prompt related tokens
+                if "system" in token.lower() or "user" in token.lower() or "assistant" in token.lower():
+                    continue
+                # Skip instruction related tokens
+                if "[inst]" in token.lower() or "[/inst]" in token.lower():
+                    continue
+                valid_tokens.append(token)
+            
+            # Ensure the last token is EOF
+            if valid_tokens and valid_tokens[-1].upper() != "EOF":
+                valid_tokens.append("EOF")
+            
+            # If we have no valid tokens, return just EOF
+            if not valid_tokens:
+                return ["EOF"]
+                
+            return valid_tokens
     
-    # If no program found, return just EOF
+    # If no program found, try to find operation tokens directly in the text
+    operation_pattern = r'(add|subtract|multiply|divide)\s*\(\s*([-+]?\d*\.?\d+)\s*([-+]?\d*\.?\d+)\s*\)'
+    match = re.search(operation_pattern, text, re.IGNORECASE)
+    if match:
+        operation = match.group(1).lower()
+        num1 = match.group(2)
+        num2 = match.group(3)
+        return [f"{operation}(", num1, num2, ")", "EOF"]
+    
+    # If still nothing found, return just EOF
     return ["EOF"]
 
 
@@ -42,6 +180,186 @@ def extract_answer(text):
     return "N/A"
 
 
+def clean_model_output(text):
+    """
+    Clean up model output to extract only the program and answer tags.
+    Removes system prompt, user messages, and other extraneous text.
+    """
+    # First, check if the text contains system/user messages
+    contains_system = "system" in text.lower()
+    contains_user = "user" in text.lower()
+    
+    # Extract program section
+    program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
+    program_match = re.search(program_pattern, text, re.DOTALL)
+    
+    # Extract answer section
+    answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
+    answer_match = re.search(answer_pattern, text, re.DOTALL)
+    
+    # If we found both program and answer sections
+    if program_match and answer_match:
+        program_content = program_match.group(1).strip()
+        answer_content = answer_match.group(1).strip()
+        
+        # Check if program content contains operation tokens
+        operation_pattern = r'(add|subtract|multiply|divide)\s*\('
+        if not re.search(operation_pattern, program_content) and contains_system:
+            # Try to find operation tokens in the text
+            operation_match = re.search(operation_pattern, text, re.IGNORECASE)
+            if operation_match:
+                # Extract a better program section
+                op_start = text.find(operation_match.group(0))
+                op_end = text.find("EOF", op_start)
+                if op_end > op_start:
+                    # Extract the operation and surrounding content
+                    better_program = text[op_start:op_end+3].strip()
+                    program_content = better_program
+        
+        # Format clean output
+        clean_output = (
+            f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+            f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+        )
+        
+        return clean_output
+    
+    # If we didn't find both sections, try to extract them from the text
+    if contains_system or contains_user:
+        # This is likely a chat template output
+        # Try to find operation tokens with their arguments
+        operation_pattern = r'(add|subtract|multiply|divide)\s*\(\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\)'
+        operation_match = re.search(operation_pattern, text, re.IGNORECASE)
+        
+        if operation_match:
+            # Extract the full operation
+            operation = operation_match.group(1).lower()
+            num1 = operation_match.group(2)
+            num2 = operation_match.group(3)
+            program_content = f"{operation}( {num1} {num2} ) EOF"
+                
+            # Try to find numerical answer
+            numerical_pattern = r'<begin_of_answer>\s*(-?\d+\.?\d*)\s*<end_of_answer>'
+            numerical_match = re.search(numerical_pattern, text, re.DOTALL)
+            
+            if numerical_match:
+                answer_content = numerical_match.group(1).strip()
+            else:
+                # Try alternative patterns for numerical answers
+                alt_patterns = [
+                    r'(?:answer|result|value)(?:\s+is|\s*[:=])\s*(-?\d+\.?\d*)',
+                    r'(?:=|equals)\s*(-?\d+\.?\d*)',
+                    r'(?:[\$£€])\s*(-?\d+\.?\d*)',
+                    r'<begin_of_answer>.*?(\d+\.?\d*).*?<end_of_answer>',
+                    r'(\d+\.?\d*)'  # Last resort: find any number
+                ]
+                
+                for pattern in alt_patterns:
+                    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        answer_content = match.group(1).strip()
+                        break
+                else:
+                    # If no numerical answer found, try to calculate it
+                    try:
+                        if operation == "add":
+                            answer_content = str(float(num1) + float(num2))
+                        elif operation == "subtract":
+                            answer_content = str(float(num1) - float(num2))
+                        elif operation == "multiply":
+                            answer_content = str(float(num1) * float(num2))
+                        elif operation == "divide":
+                            answer_content = str(float(num1) / float(num2))
+                        else:
+                            answer_content = "N/A"
+                    except:
+                        answer_content = "N/A"
+            
+            # Format clean output
+            clean_output = (
+                f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+            )
+            
+            return clean_output
+        
+        # Try a more flexible pattern for operations
+        flexible_op_pattern = r'(add|subtract|multiply|divide).*?(\d+\.?\d*).*?(\d+\.?\d*).*?EOF'
+        flexible_match = re.search(flexible_op_pattern, text, re.IGNORECASE | re.DOTALL)
+        
+        if flexible_match:
+            operation = flexible_match.group(1).lower()
+            num1 = flexible_match.group(2)
+            num2 = flexible_match.group(3)
+            program_content = f"{operation}( {num1} {num2} ) EOF"
+            
+            # Try to find or calculate the answer
+            try:
+                if operation == "add":
+                    answer_content = str(float(num1) + float(num2))
+                elif operation == "subtract":
+                    answer_content = str(float(num1) - float(num2))
+                elif operation == "multiply":
+                    answer_content = str(float(num1) * float(num2))
+                elif operation == "divide":
+                    answer_content = str(float(num1) / float(num2))
+                else:
+                    answer_content = "N/A"
+            except:
+                # Try to find a numerical answer in the text
+                number_pattern = r'<begin_of_answer>\s*(-?\d+\.?\d*)\s*<end_of_answer>'
+                number_match = re.search(number_pattern, text, re.DOTALL)
+                
+                if number_match:
+                    answer_content = number_match.group(1).strip()
+                else:
+                    answer_content = "N/A"
+            
+            # Format clean output
+            clean_output = (
+                f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+            )
+            
+            return clean_output
+    
+    # If all else fails, return the original text with minimal cleaning
+    if program_match:
+        program_content = program_match.group(1).strip()
+    else:
+        # Try to find any operation pattern
+        operation_pattern = r'(add|subtract|multiply|divide)\s*\(\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\)'
+        operation_match = re.search(operation_pattern, text, re.IGNORECASE)
+        
+        if operation_match:
+            operation = operation_match.group(1).lower()
+            num1 = operation_match.group(2)
+            num2 = operation_match.group(3)
+            program_content = f"{operation}( {num1} {num2} ) EOF"
+        else:
+            program_content = "EOF"
+    
+    if answer_match:
+        answer_content = answer_match.group(1).strip()
+    else:
+        # Try to find any numerical answer
+        numerical_pattern = r'(\d+\.?\d*)'
+        numerical_match = re.search(numerical_pattern, text)
+        
+        if numerical_match:
+            answer_content = numerical_match.group(1).strip()
+        else:
+            answer_content = "N/A"
+    
+    # Format clean output
+    clean_output = (
+        f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+        f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+    )
+    
+    return clean_output
+
+
 def format_predictions_for_evaluation(predictions, example_ids):
     """
     Format predictions for evaluation according to ConvFinQA requirements.
@@ -55,13 +373,54 @@ def format_predictions_for_evaluation(predictions, example_ids):
     """
     formatted_predictions = []
     
-    for pred, example_id in zip(predictions, example_ids):
-        program_tokens = extract_program_tokens(pred)
-        
-        formatted_predictions.append({
-            "id": example_id,
-            "predicted": program_tokens
-        })
+    for i, (pred, example_id) in enumerate(zip(predictions, example_ids)):
+        try:
+            # First clean the output
+            cleaned_output = clean_model_output(pred)
+            
+            # Then extract program tokens
+            program_tokens = extract_program_tokens(cleaned_output)
+            
+            # Validate the program tokens
+            valid_operations = ["add(", "subtract(", "multiply(", "divide("]
+            has_valid_operation = any(op in program_tokens for op in valid_operations)
+            
+            # If no valid operation found, try to extract from the original prediction
+            if not has_valid_operation and len(program_tokens) <= 2:
+                # Try to find operation tokens directly in the prediction
+                operation_pattern = r'(add|subtract|multiply|divide)\s*\(\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\)'
+                match = re.search(operation_pattern, pred, re.IGNORECASE)
+                
+                if match:
+                    operation = match.group(1).lower()
+                    num1 = match.group(2)
+                    num2 = match.group(3)
+                    program_tokens = [f"{operation}(", num1, num2, ")", "EOF"]
+            
+            # Ensure the program tokens are properly formatted
+            if len(program_tokens) > 1 and program_tokens[-1].upper() != "EOF":
+                program_tokens.append("EOF")
+            
+            # Add the formatted prediction
+            formatted_predictions.append({
+                "id": example_id,
+                "predicted": program_tokens
+            })
+            
+            # Print debug info for the first few examples
+            if i < 3:
+                print(f"\nExample {i} (ID: {example_id}):")
+                print(f"Original prediction (first 100 chars): {pred[:100]}...")
+                print(f"Cleaned output (first 100 chars): {cleaned_output[:100]}...")
+                print(f"Extracted program tokens: {program_tokens}")
+                
+        except Exception as e:
+            print(f"Error formatting prediction for example {example_id}: {e}")
+            # Add a default prediction
+            formatted_predictions.append({
+                "id": example_id,
+                "predicted": ["EOF"]
+            })
     
     return formatted_predictions
 

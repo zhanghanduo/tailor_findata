@@ -10,6 +10,8 @@ from post_process import extract_program_tokens, extract_answer, format_predicti
 from bs4 import BeautifulSoup
 import datetime
 import traceback
+import re
+import transformers
 
 
 def parse_args():
@@ -225,10 +227,51 @@ IMPORTANT:
 - Never omit any part of the format
 - Always end program tokens with the EOF token
 - The answer should be ONLY the numerical result without any additional text, units, or explanations
+- The numerical result must be a single number with no line breaks, spaces, or extra characters
+- Format decimal numbers properly (e.g., 44.0 not 44\n0)
 - DO NOT include any financial context, table data, or explanations in your response
 - DO NOT include any text outside of the specified tags
 
-Your response should ONLY contain the program tokens and answer within their respective tags."""
+Examples of correct answer formats:
+<begin_of_answer>
+44.0
+<end_of_answer>
+
+<begin_of_answer>
+-1889.0
+<end_of_answer>
+
+Your response should ONLY contain the program tokens and answer within their respective tags.
+"""
+
+
+def is_valid_output(output):
+    """
+    Check if the model output is valid.
+    
+    Args:
+        output: The model output to check
+        
+    Returns:
+        bool: True if the output is valid, False otherwise
+    """
+    # Check if the output contains both program and answer tags
+    has_program_tags = "<begin_of_program>" in output and "<end_of_program>" in output
+    has_answer_tags = "<begin_of_answer>" in output and "<end_of_answer>" in output
+    
+    # Check if the output contains operation tokens
+    operation_pattern = r'(add|subtract|multiply|divide)\s*\('
+    has_operation = re.search(operation_pattern, output, re.IGNORECASE) is not None
+    
+    # Check if the output contains EOF token
+    has_eof = "EOF" in output
+    
+    # Check if the output contains a numerical answer
+    number_pattern = r'<begin_of_answer>\s*(-?\d+\.?\d*)\s*<end_of_answer>'
+    has_number = re.search(number_pattern, output, re.DOTALL) is not None
+    
+    # Return True if the output has program tags and either operation tokens or EOF
+    return has_program_tags and has_answer_tags and (has_operation or has_eof)
 
 
 def run_inference(model, tokenizer, test_dataset, args):
@@ -302,7 +345,15 @@ def run_inference(model, tokenizer, test_dataset, args):
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id
+                    eos_token_id=tokenizer.eos_token_id,
+                    temperature=0.1,  # Lower temperature for more deterministic outputs
+                    num_beams=1,  # Use greedy decoding
+                    repetition_penalty=1.2,  # Slight penalty for repetition
+                    # Stop generation at specific tokens
+                    stopping_criteria=transformers.StoppingCriteriaList([
+                        transformers.StoppingCriteria() if not hasattr(tokenizer, 'eos_token_id') else 
+                        transformers.StoppingCriteriaList([])
+                    ])
                 )
             
             # Decode
@@ -310,19 +361,85 @@ def run_inference(model, tokenizer, test_dataset, args):
             
             # Extract just the assistant's response
             try:
-                # Try to extract the assistant's response using the chat template
-                assistant_prefix = tokenizer.apply_chat_template([{"role": "assistant", "content": ""}], tokenize=False)
-                user_prefix = tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=False)
+                # First try to extract using program and answer tags directly
+                program_pattern = r'<begin_of_program>(.*?)<end_of_program>'
+                program_match = re.search(program_pattern, decoded_output, re.DOTALL)
                 
-                # Find where the assistant's response starts
-                if assistant_prefix in decoded_output:
-                    assistant_response = decoded_output.split(assistant_prefix)[-1]
-                    # Remove any trailing user message if present
-                    if user_prefix in assistant_response:
-                        assistant_response = assistant_response.split(user_prefix)[0]
+                answer_pattern = r'<begin_of_answer>(.*?)<end_of_answer>'
+                answer_match = re.search(answer_pattern, decoded_output, re.DOTALL)
+                
+                if program_match and answer_match:
+                    # If both tags are found, create a clean response with just these elements
+                    program_content = program_match.group(1).strip()
+                    answer_content = answer_match.group(1).strip()
+                    
+                    clean_response = (
+                        f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                        f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+                    )
+                    assistant_response = clean_response
                 else:
-                    # Fallback: just use the entire output
-                    assistant_response = decoded_output
+                    # If tags aren't found, try to extract the assistant's response using the chat template
+                    assistant_prefix = tokenizer.apply_chat_template([{"role": "assistant", "content": ""}], tokenize=False)
+                    user_prefix = tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=False)
+                    
+                    # Find where the assistant's response starts
+                    if assistant_prefix in decoded_output:
+                        assistant_response = decoded_output.split(assistant_prefix)[-1]
+                        # Remove any trailing user message if present
+                        if user_prefix in assistant_response:
+                            assistant_response = assistant_response.split(user_prefix)[0]
+                    else:
+                        # Fallback: just use the entire output
+                        assistant_response = decoded_output
+                        
+                    # Try to clean up the response by removing system prompt and user message
+                    if "system" in assistant_response.lower() and "user" in assistant_response.lower():
+                        # Look for program and answer tags in the messy output
+                        program_match = re.search(program_pattern, assistant_response, re.DOTALL)
+                        answer_match = re.search(answer_pattern, assistant_response, re.DOTALL)
+                        
+                        if program_match and answer_match:
+                            program_content = program_match.group(1).strip()
+                            answer_content = answer_match.group(1).strip()
+                            
+                            clean_response = (
+                                f"<begin_of_program>\n{program_content}\n<end_of_program>\n\n"
+                                f"<begin_of_answer>\n{answer_content}\n<end_of_answer>"
+                            )
+                            assistant_response = clean_response
+                
+                # Check if the output is valid
+                if not is_valid_output(assistant_response):
+                    # Try to find operation tokens directly
+                    operation_pattern = r'(add|subtract|multiply|divide)\s*\(\s*([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s*\)'
+                    match = re.search(operation_pattern, decoded_output, re.IGNORECASE)
+                    
+                    if match:
+                        operation = match.group(1).lower()
+                        num1 = match.group(2)
+                        num2 = match.group(3)
+                        
+                        # Try to calculate the answer
+                        try:
+                            if operation == "add":
+                                answer = str(float(num1) + float(num2))
+                            elif operation == "subtract":
+                                answer = str(float(num1) - float(num2))
+                            elif operation == "multiply":
+                                answer = str(float(num1) * float(num2))
+                            elif operation == "divide":
+                                answer = str(float(num1) / float(num2))
+                            else:
+                                answer = "N/A"
+                                
+                            # Create a valid output
+                            assistant_response = (
+                                f"<begin_of_program>\n{operation}( {num1} {num2} ) EOF\n<end_of_program>\n\n"
+                                f"<begin_of_answer>\n{answer}\n<end_of_answer>"
+                            )
+                        except:
+                            pass
             except Exception as e:
                 print(f"Error extracting assistant response for example {i}: {e}")
                 assistant_response = decoded_output

@@ -307,6 +307,16 @@ def prepare_dataset(tokenizer, args):
         print(f"Limiting evaluation dataset to {args.max_eval_samples} samples")
         eval_dataset = eval_dataset.select(range(min(len(eval_dataset), args.max_eval_samples)))
     
+    # Set padding and truncation settings for Qwen models BEFORE formatting
+    if "qwen" in args.model_name.lower():
+        print("Applying padding and truncation settings for Qwen model")
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        
+        # Remove reference to model which is not available in this scope
+        # We'll handle model config updates in the setup_trainer function
+    
     # Format datasets
     train_dataset = train_dataset.map(
         formatting_prompts_func,
@@ -321,12 +331,41 @@ def prepare_dataset(tokenizer, args):
             num_proc=2,
         )
     
-    # Add padding and truncation for Qwen models
+    # For Qwen models, tokenize the dataset with explicit padding and truncation
     if "qwen" in args.model_name.lower():
-        print("Applying padding and truncation settings for Qwen model")
-        tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        print("Tokenizing Qwen dataset with explicit padding and truncation")
+        
+        def tokenize_function(examples):
+            # Tokenize with explicit padding and truncation
+            tokenized = tokenizer(
+                examples["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=args.max_seq_length,
+                return_tensors=None  # Return Python lists
+            )
+            return tokenized
+        
+        # Apply tokenization
+        train_dataset = train_dataset.map(
+            tokenize_function,
+            batched=True,
+            num_proc=2,
+            remove_columns=["text"]  # Remove the original text column
+        )
+        
+        if eval_dataset:
+            eval_dataset = eval_dataset.map(
+                tokenize_function,
+                batched=True,
+                num_proc=2,
+                remove_columns=["text"]
+            )
+        
+        # Convert to torch tensors
+        train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        if eval_dataset:
+            eval_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
     
     print(f"Train dataset size: {len(train_dataset)}")
     if eval_dataset:
@@ -844,14 +883,15 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
     
     # Set padding and truncation settings for Qwen models
     if "qwen" in args.model_name.lower():
-        print("Applying Qwen-specific padding and truncation settings")
+        print("Applying Qwen-specific padding and truncation settings in trainer setup")
         tokenizer.padding_side = "left"
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
         
-        # Update model config if needed
-        if hasattr(model.config, "pad_token_id"):
+        # Update model config
+        if hasattr(model, "config"):
             model.config.pad_token_id = tokenizer.pad_token_id
+            print(f"Updated model config pad_token_id to {model.config.pad_token_id}")
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -902,6 +942,18 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         pad_to_multiple_of=8,  # Optimize for hardware
         return_tensors="pt"
     )
+    
+    # For Qwen models, ensure the data collator has the right settings
+    if "qwen" in args.model_name.lower():
+        print("Configuring data collator for Qwen model")
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            padding="max_length",  # Force max_length padding
+            max_length=args.max_seq_length,
+            pad_to_multiple_of=8,
+            truncation=True,  # Ensure truncation is enabled
+            return_tensors="pt"
+        )
     
     trainer = SFTTrainer(
         model=model,
@@ -957,30 +1009,104 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
 def train_model(trainer):
     """Train the model and return training stats."""
     print("Starting training...")
-    trainer_stats = trainer.train()
     
-    # Log final metrics
-    if wandb.run:
-        metrics = {
-            "train/global_step": trainer_stats.global_step,
-        }
+    # Check if we're using a Qwen model
+    is_qwen = False
+    if hasattr(trainer.model, "config") and hasattr(trainer.model.config, "model_type"):
+        is_qwen = "qwen" in trainer.model.config.model_type.lower()
+    elif hasattr(trainer.args, "model_name_or_path"):
+        is_qwen = "qwen" in trainer.args.model_name_or_path.lower()
+    
+    # Special handling for Qwen models
+    if is_qwen:
+        print("\n===== SPECIAL HANDLING FOR QWEN MODEL =====")
+        print("Checking dataset format before training...")
         
-        # Add training loss if available
-        if hasattr(trainer_stats, 'training_loss') and trainer_stats.training_loss is not None:
-            metrics["train/final_loss"] = trainer_stats.training_loss
+        # Check if the dataset is already tokenized
+        if hasattr(trainer.train_dataset, "features") and "input_ids" in trainer.train_dataset.features:
+            print("✅ Dataset is already tokenized with input_ids")
             
-        # Add epoch if available
-        if hasattr(trainer_stats, 'epoch') and trainer_stats.epoch is not None:
-            metrics["train/epoch"] = trainer_stats.epoch
-            
-        # Add padding and truncation settings
-        metrics["train/max_length"] = trainer.args.max_length
-        metrics["train/padding"] = trainer.args.padding
-        metrics["train/truncation"] = trainer.args.truncation
-            
-        wandb.log(metrics)
+            # Check a sample to ensure consistent lengths
+            sample = trainer.train_dataset[0]
+            if "input_ids" in sample and "attention_mask" in sample:
+                print(f"Sample input_ids length: {len(sample['input_ids'])}")
+                print(f"Sample attention_mask length: {len(sample['attention_mask'])}")
+                
+                if len(sample['input_ids']) != len(sample['attention_mask']):
+                    print("⚠️ WARNING: input_ids and attention_mask have different lengths!")
+                    print("Attempting to fix by truncating to shorter length...")
+                    
+                    # This is a last resort fix - ideally the dataset preparation should handle this
+                    def fix_length_mismatch(dataset):
+                        fixed_dataset = []
+                        for item in dataset:
+                            input_ids_len = len(item['input_ids'])
+                            attn_mask_len = len(item['attention_mask'])
+                            min_len = min(input_ids_len, attn_mask_len)
+                            
+                            fixed_item = {
+                                'input_ids': item['input_ids'][:min_len],
+                                'attention_mask': item['attention_mask'][:min_len]
+                            }
+                            fixed_dataset.append(fixed_item)
+                        
+                        return Dataset.from_list(fixed_dataset)
+                    
+                    print("Fixing train dataset...")
+                    trainer.train_dataset = fix_length_mismatch(trainer.train_dataset)
+                    
+                    if trainer.eval_dataset:
+                        print("Fixing eval dataset...")
+                        trainer.eval_dataset = fix_length_mismatch(trainer.eval_dataset)
+                    
+                    print("Dataset lengths fixed.")
+        else:
+            print("⚠️ Dataset is not tokenized with input_ids. This may cause issues with Qwen models.")
     
-    return trainer_stats
+    # Wrap the training in a try-except block to provide better error messages
+    try:
+        trainer_stats = trainer.train()
+        
+        # Log final metrics
+        if wandb.run:
+            metrics = {
+                "train/global_step": trainer_stats.global_step,
+            }
+            
+            # Add training loss if available
+            if hasattr(trainer_stats, 'training_loss') and trainer_stats.training_loss is not None:
+                metrics["train/final_loss"] = trainer_stats.training_loss
+                
+            # Add epoch if available
+            if hasattr(trainer_stats, 'epoch') and trainer_stats.epoch is not None:
+                metrics["train/epoch"] = trainer_stats.epoch
+                
+            # Add padding and truncation settings
+            metrics["train/max_length"] = trainer.args.max_length
+            metrics["train/padding"] = trainer.args.padding
+            metrics["train/truncation"] = trainer.args.truncation
+                
+            wandb.log(metrics)
+        
+        return trainer_stats
+    
+    except ValueError as e:
+        if "expected sequence of length" in str(e) and is_qwen:
+            print("\n===== QWEN MODEL ERROR =====")
+            print("Encountered sequence length mismatch error, which is common with Qwen models.")
+            print("Error details:", str(e))
+            print("\nPossible solutions:")
+            print("1. Make sure all sequences in a batch have the same length")
+            print("2. Use padding='max_length' and truncation=True in tokenizer")
+            print("3. Ensure input_ids and attention_mask have the same length")
+            print("4. Try reducing batch size or max_seq_length")
+            print("5. Check if the dataset is properly tokenized before training")
+            
+            # Re-raise the error to stop execution
+            raise ValueError("Qwen model training failed due to sequence length mismatch. See above for details.") from e
+        else:
+            # For other errors, just re-raise
+            raise
 
 
 def save_model(model, tokenizer, args):
