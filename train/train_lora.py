@@ -14,6 +14,7 @@ from transformers import (
     TextStreamer,
     EvalPrediction
 )
+import transformers
 import torch
 from train_utils import (
     apply_custom_chat_template,
@@ -491,12 +492,21 @@ def analyze_predictions(pred_str, label_str, pred_answers, label_answers, step=N
 
 
 def get_compute_metrics_fn(tokenizer):
-    """Create a compute_metrics function that has access to the tokenizer."""
-    # Get the vocabulary size for clipping
-    vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 32000  # Default fallback
+    """
+    Returns a function that computes metrics for the model.
+    """
     
-    def compute_metrics(eval_preds):
-        """Compute metrics for evaluation."""
+    def compute_metrics(eval_preds, trainer_instance=None):
+        """
+        Compute metrics for the model.
+        
+        Args:
+            eval_preds: Tuple of predictions and labels
+            trainer_instance: Optional reference to the trainer instance
+            
+        Returns:
+            metrics: Dictionary of metrics
+        """
         preds, labels = eval_preds
         
         # Debug information
@@ -505,7 +515,7 @@ def get_compute_metrics_fn(tokenizer):
         print(f"Predictions shape: {preds.shape if hasattr(preds, 'shape') else 'No shape attribute'}")
         print(f"Labels type: {type(labels)}")
         print(f"Labels shape: {labels.shape if hasattr(labels, 'shape') else 'No shape attribute'}")
-        print(f"Tokenizer vocabulary size: {vocab_size}")
+        print(f"Tokenizer vocabulary size: {tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 32000}")
         
         if len(preds) > 0:
             print(f"First prediction type: {type(preds[0])}")
@@ -538,9 +548,9 @@ def get_compute_metrics_fn(tokenizer):
                     # For numpy integers, convert to Python int
                     int_val = int(token)
                     # Clip to valid vocabulary range if needed
-                    if int_val >= vocab_size:
-                        print(f"  - Clipping token {int_val} to vocab size {vocab_size-1}")
-                        return vocab_size - 1
+                    if int_val >= tokenizer.vocab_size:
+                        print(f"  - Clipping token {int_val} to vocab size {tokenizer.vocab_size-1}")
+                        return tokenizer.vocab_size - 1
                     elif int_val < 0:
                         # Skip negative tokens (they're masked)
                         return None
@@ -549,9 +559,9 @@ def get_compute_metrics_fn(tokenizer):
                     # For floats that are integers
                     int_val = int(token)
                     # Clip to valid vocabulary range if needed
-                    if int_val >= vocab_size:
-                        print(f"  - Clipping token {int_val} to vocab size {vocab_size-1}")
-                        return vocab_size - 1
+                    if int_val >= tokenizer.vocab_size:
+                        print(f"  - Clipping token {int_val} to vocab size {tokenizer.vocab_size-1}")
+                        return tokenizer.vocab_size - 1
                     elif int_val < 0:
                         # Skip negative tokens (they're masked)
                         return None
@@ -568,9 +578,9 @@ def get_compute_metrics_fn(tokenizer):
             has_last_responses = False
             
             # For Qwen models, try to get the last_assistant_response directly from the dataset
-            if is_qwen and hasattr(trainer, 'eval_dataset'):
+            if is_qwen and hasattr(trainer_instance, 'eval_dataset'):
                 print("\nChecking for last_assistant_response field in eval_dataset...")
-                sample = trainer.eval_dataset[0] if len(trainer.eval_dataset) > 0 else {}
+                sample = trainer_instance.eval_dataset[0] if len(trainer_instance.eval_dataset) > 0 else {}
                 has_last_responses = "last_assistant_response" in sample
                 
                 if has_last_responses:
@@ -578,7 +588,7 @@ def get_compute_metrics_fn(tokenizer):
                     # We'll use this field directly for labels
                     
                     # Get all the last_assistant_responses
-                    last_responses = [example["last_assistant_response"] for example in trainer.eval_dataset]
+                    last_responses = [example["last_assistant_response"] for example in trainer_instance.eval_dataset]
                     print(f"Loaded {len(last_responses)} last_assistant_responses")
                     
                     # Use these as the ground truth labels
@@ -1043,7 +1053,9 @@ def get_compute_metrics_fn(tokenizer):
 
 
 def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
-    """Set up the SFT trainer."""
+    """
+    Set up the trainer for fine-tuning.
+    """
     # Ensure max_steps is an integer
     max_steps = args.max_steps if args.max_steps > 0 else -1
     
@@ -1070,6 +1082,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
             model.config.pad_token_id = tokenizer.pad_token_id
             print(f"Updated model config pad_token_id to {model.config.pad_token_id}")
     
+    # Set up training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -1102,7 +1115,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         # Ensure we get predictions, not just loss
         prediction_loss_only=False,
     )
-    
+
     # Create callbacks list
     callbacks = []
     
@@ -1130,43 +1143,6 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
             pad_to_multiple_of=8,
             return_tensors="pt"
         )
-        
-        # For Qwen models, add special handling for evaluation
-        if eval_dataset:
-            print("Adding special handling for Qwen model evaluation")
-            
-            # Check if the dataset has the last_assistant_response field
-            sample = eval_dataset[0] if len(eval_dataset) > 0 else {}
-            has_last_responses = "last_assistant_response" in sample
-            
-            if has_last_responses:
-                print("Found last_assistant_response field in evaluation dataset")
-                
-                # Create a custom compute_metrics function that uses the last_assistant_response
-                original_compute_metrics = get_compute_metrics_fn(tokenizer)
-                
-                def qwen_compute_metrics(eval_preds):
-                    # Store a reference to the trainer for use in compute_metrics
-                    global trainer
-                    
-                    # Call the original compute_metrics function
-                    metrics = original_compute_metrics(eval_preds)
-                    
-                    # Add a note that we're using the special Qwen handling
-                    metrics["using_qwen_special_handling"] = True
-                    
-                    return metrics
-                
-                # Use the custom compute_metrics function
-                compute_metrics_fn = qwen_compute_metrics
-            else:
-                # Use the standard compute_metrics function
-                compute_metrics_fn = get_compute_metrics_fn(tokenizer)
-        else:
-            compute_metrics_fn = None
-    else:
-        # For non-Qwen models, use the standard compute_metrics function
-        compute_metrics_fn = get_compute_metrics_fn(tokenizer) if eval_dataset else None
     
     trainer = SFTTrainer(
         model=model,
@@ -1179,7 +1155,7 @@ def setup_trainer(model, tokenizer, train_dataset, eval_dataset, args):
         dataset_num_proc=2,
         packing=False,
         args=training_args,
-        compute_metrics=compute_metrics_fn,
+        compute_metrics=get_compute_metrics_fn(tokenizer) if eval_dataset else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset else None,
         callbacks=callbacks,
     )

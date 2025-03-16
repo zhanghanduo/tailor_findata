@@ -64,7 +64,7 @@ def extract_program_tokens(text):
                         i += 2  # Skip the operation and the opening parenthesis
                         in_operation = True
                     else:
-                        tokens.append(token.lower())
+                        tokens.append(token.lower() + "(")  # Always append with parenthesis
                         i += 1
                 # Handle opening parenthesis
                 elif token == "(" and i > 0 and raw_tokens[i-1].lower() in ["add", "subtract", "multiply", "divide"]:
@@ -72,9 +72,14 @@ def extract_program_tokens(text):
                     i += 1
                 # Handle standalone opening parenthesis
                 elif token == "(":
-                    tokens.append(token)
-                    i += 1
-                    in_operation = True
+                    # Check if previous token was an operation
+                    if i > 0 and raw_tokens[i-1].lower() in ["add", "subtract", "multiply", "divide"]:
+                        # Already handled with the operation
+                        i += 1
+                    else:
+                        tokens.append(token)
+                        i += 1
+                        in_operation = True
                 # Handle closing parenthesis
                 elif token == ")":
                     tokens.append(token)
@@ -82,27 +87,59 @@ def extract_program_tokens(text):
                     in_operation = False
                 # Handle tokens with attached parentheses
                 elif "(" in token or ")" in token:
-                    # Split the token by parentheses
-                    parts = []
-                    current_part = ""
-                    for char in token:
-                        if char in "()":
+                    # Check if it's an operation with attached parenthesis
+                    op_match = re.match(r'(add|subtract|multiply|divide)(\(.*)', token, re.IGNORECASE)
+                    if op_match:
+                        tokens.append(op_match.group(1).lower() + "(")
+                        
+                        # Process the rest of the token
+                        rest = op_match.group(2)[1:]  # Remove the opening parenthesis
+                        if rest:
+                            # Split by any remaining parentheses
+                            parts = []
+                            current_part = ""
+                            for char in rest:
+                                if char in "()":
+                                    if current_part:
+                                        parts.append(current_part)
+                                        current_part = ""
+                                    parts.append(char)
+                                else:
+                                    current_part += char
                             if current_part:
                                 parts.append(current_part)
-                                current_part = ""
-                            parts.append(char)
-                        else:
-                            current_part += char
-                    if current_part:
-                        parts.append(current_part)
-                    
-                    # Add each part as a separate token
-                    for part in parts:
-                        if part == "(":
-                            in_operation = True
-                        elif part == ")":
-                            in_operation = False
-                        tokens.append(part)
+                            
+                            # Add each part as a separate token
+                            for part in parts:
+                                if part == "(":
+                                    in_operation = True
+                                elif part == ")":
+                                    in_operation = False
+                                    tokens.append(part)
+                                else:
+                                    tokens.append(part)
+                    else:
+                        # Split the token by parentheses
+                        parts = []
+                        current_part = ""
+                        for char in token:
+                            if char in "()":
+                                if current_part:
+                                    parts.append(current_part)
+                                    current_part = ""
+                                parts.append(char)
+                            else:
+                                current_part += char
+                        if current_part:
+                            parts.append(current_part)
+                        
+                        # Add each part as a separate token
+                        for part in parts:
+                            if part == "(":
+                                in_operation = True
+                            elif part == ")":
+                                in_operation = False
+                            tokens.append(part)
                     
                     i += 1
                 # Handle reference numbers (with # symbol)
@@ -501,10 +538,21 @@ def format_predictions_for_evaluation(predictions, example_ids):
             if len(program_tokens) > 1 and program_tokens[-1].upper() != "EOF":
                 program_tokens.append("EOF")
             
+            # Format tokens to match the official format
+            formatted_tokens = []
+            for token in program_tokens:
+                # Handle operation tokens
+                if token.lower() in ["add", "subtract", "multiply", "divide"]:
+                    formatted_tokens.append(token.lower() + "(")
+                elif token.lower() in ["add(", "subtract(", "multiply(", "divide("]:
+                    formatted_tokens.append(token.lower())
+                else:
+                    formatted_tokens.append(token)
+            
             # Add the formatted prediction
             formatted_predictions.append({
                 "id": example_id,
-                "predicted": program_tokens
+                "predicted": formatted_tokens
             })
             
             # Print debug info for the first few examples
@@ -513,6 +561,7 @@ def format_predictions_for_evaluation(predictions, example_ids):
                 print(f"Original prediction (first 100 chars): {pred[:100]}...")
                 print(f"Cleaned output (first 100 chars): {cleaned_output[:100]}...")
                 print(f"Extracted program tokens: {program_tokens}")
+                print(f"Formatted tokens: {formatted_tokens}")
                 
         except Exception as e:
             print(f"Error formatting prediction for example {example_id}: {e}")

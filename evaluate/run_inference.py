@@ -558,28 +558,19 @@ def main():
         # Format predictions for evaluation
         formatted_predictions = format_predictions_for_evaluation(predictions, example_ids)
         
-        # Restructure the predictions to match the expected format for evaluation
-        evaluation_format = {}
-        for pred in formatted_predictions:
-            example_id = pred["id"]
-            evaluation_format[example_id] = [{
-                "id": example_id,
-                "pred_prog": pred["predicted"]
-            }]
-        
         # Save formatted predictions
         formatted_predictions_file = os.path.join(args.output_dir, "formatted_predictions.json")
         with open(formatted_predictions_file, 'w') as f:
-            json.dump(evaluation_format, f, indent=2)
+            json.dump(formatted_predictions, f, indent=2)
         
         print(f"Formatted predictions saved to {formatted_predictions_file}")
         
         # Print sample predictions
         print("\nSample predictions:")
-        for i, example_id in enumerate(list(evaluation_format.keys())[:3]):
-            print(f"Example ID: {example_id}")
+        for i in range(min(3, len(predictions))):
+            print(f"Example ID: {example_ids[i]}")
             print(f"Raw prediction: {predictions[i][:100]}...")
-            print(f"Extracted program: {evaluation_format[example_id][0]['pred_prog']}")
+            print(f"Extracted program: {formatted_predictions[i]['predicted']}")
             print()
         
         # Log completion
