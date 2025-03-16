@@ -642,7 +642,8 @@ def get_compute_metrics_fn(tokenizer):
                             
                             # IMPORTANT FIX: For Qwen models, extract the actual answer from the label
                             # This fixes the issue where labels are showing up as "and" instead of the actual answer
-                            is_qwen = "qwen" in trainer.args.model_name_or_path.lower() if hasattr(trainer.args, "model_name_or_path") else False
+                            # Check if we're using a Qwen model based on tokenizer name
+                            is_qwen = "qwen" in tokenizer.__class__.__name__.lower()
                             
                             if is_qwen:
                                 # Look for the assistant's response in the decoded label
@@ -770,30 +771,9 @@ def get_compute_metrics_fn(tokenizer):
                     print(f"Error processing prediction answer: {e}")
                     pred_answers.append("")
             
-            # Check if we're using a Qwen model and have last_assistant_response available
-            is_qwen = False
+            # Check if we're using a Qwen model based on tokenizer name
+            is_qwen = "qwen" in tokenizer.__class__.__name__.lower()
             has_last_responses = False
-            
-            if hasattr(trainer, "args") and hasattr(trainer.args, "model_name_or_path"):
-                is_qwen = "qwen" in trainer.args.model_name_or_path.lower()
-                
-            if is_qwen and hasattr(trainer, "eval_dataset"):
-                # Check if the dataset has the last_assistant_response field
-                sample = trainer.eval_dataset[0] if len(trainer.eval_dataset) > 0 else {}
-                has_last_responses = "last_assistant_response" in sample
-                
-                if has_last_responses:
-                    print("\nUsing extracted last_assistant_response for Qwen model evaluation")
-                    
-                    # Replace label_str with the extracted responses
-                    label_str = []
-                    for i in range(min(len(pred_str), len(trainer.eval_dataset))):
-                        try:
-                            response = trainer.eval_dataset[i]["last_assistant_response"]
-                            label_str.append(response)
-                        except Exception as e:
-                            print(f"Error getting last_assistant_response for sample {i}: {e}")
-                            label_str.append("")
             
             for l in label_str:
                 try:
