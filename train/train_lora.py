@@ -321,6 +321,13 @@ def prepare_dataset(tokenizer, args):
             num_proc=2,
         )
     
+    # Add padding and truncation for Qwen models
+    if "qwen" in args.model_name.lower():
+        print("Applying padding and truncation settings for Qwen model")
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
     print(f"Train dataset size: {len(train_dataset)}")
     if eval_dataset:
         print(f"Eval dataset size: {len(eval_dataset)}")
@@ -945,6 +952,11 @@ def train_model(trainer):
         # Add epoch if available
         if hasattr(trainer_stats, 'epoch') and trainer_stats.epoch is not None:
             metrics["train/epoch"] = trainer_stats.epoch
+            
+        # Add padding and truncation settings
+        metrics["train/max_length"] = trainer.args.max_length
+        metrics["train/padding"] = trainer.args.padding
+        metrics["train/truncation"] = trainer.args.truncation
             
         wandb.log(metrics)
     

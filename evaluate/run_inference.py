@@ -291,7 +291,8 @@ def run_inference(model, tokenizer, test_dataset, args):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=args.max_length
+                max_length=args.max_length,
+                pad_to_multiple_of=8
             ).to(args.device)
             
             # Generate
@@ -300,7 +301,8 @@ def run_inference(model, tokenizer, test_dataset, args):
                     **inputs,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id
                 )
             
             # Decode
@@ -377,6 +379,8 @@ def main():
             model = AutoModelForCausalLM.from_pretrained(args.model_path).to(args.device)
         
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = tokenizer.eos_token
         
         # Prepare test data
         print(f"Preparing test data from {args.test_data}")
@@ -432,4 +436,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  
+    main()
