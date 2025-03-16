@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=3407, help="Random seed")
     parser.add_argument("--wandb_project", type=str, default="phi4-lora-sft", help="Weights & Biases project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
-    parser.add_argument("--eval_split_percentage", type=int, default=4, help="Percentage of data to use for evaluation")
+    parser.add_argument("--eval_split_percentage", type=int, default=4, help="Percentage of data to use for evaluation (only used if dataset has no validation split)")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Maximum number of samples to use for evaluation")
     parser.add_argument("--force_dataset_download", action="store_true", default=False, help="Force redownload of dataset instead of using cache")
@@ -192,28 +192,40 @@ def prepare_dataset(tokenizer, args):
     # Load dataset
     print(f"Loading dataset: {args.dataset_name}")
 
-    dataset = load_dataset(
-        args.dataset_name, 
-        split="train",
+    # Load both train and validation splits
+    dataset_dict = load_dataset(
+        args.dataset_name,
         cache_dir=None,  # Don't use cache
         download_mode="force_redownload" if args.force_dataset_download else "reuse_dataset_if_exists",  # Force redownload if specified
         verification_mode="no_checks"  # Skip verification checks
     )
-    dataset = standardize_sharegpt(dataset)
     
-    # Create train/eval split
-    if args.eval_split_percentage > 0:
-        dataset = dataset.train_test_split(test_size=args.eval_split_percentage/100, seed=args.seed)
-        train_dataset = dataset["train"]
-        eval_dataset = dataset["test"]
+    # Check if the dataset has a validation split
+    if "validation" in dataset_dict:
+        print("Using existing train/validation splits from the dataset")
+        train_dataset = dataset_dict["train"]
+        eval_dataset = dataset_dict["validation"]
         
-        # Limit eval dataset size if specified
-        if args.max_eval_samples is not None and args.max_eval_samples > 0:
-            print(f"Limiting evaluation dataset to {args.max_eval_samples} samples")
-            eval_dataset = eval_dataset.select(range(min(len(eval_dataset), args.max_eval_samples)))
+        # Standardize the format
+        train_dataset = standardize_sharegpt(train_dataset)
+        eval_dataset = standardize_sharegpt(eval_dataset)
     else:
-        train_dataset = dataset
-        eval_dataset = None
+        # Fall back to creating a split if no validation set exists
+        print("No validation split found in dataset. Creating a custom split.")
+        train_dataset = dataset_dict["train"]
+        train_dataset = standardize_sharegpt(train_dataset)
+        
+        if args.eval_split_percentage > 0:
+            split = train_dataset.train_test_split(test_size=args.eval_split_percentage/100, seed=args.seed)
+            train_dataset = split["train"]
+            eval_dataset = split["test"]
+        else:
+            eval_dataset = None
+    
+    # Limit eval dataset size if specified
+    if eval_dataset and args.max_eval_samples is not None and args.max_eval_samples > 0:
+        print(f"Limiting evaluation dataset to {args.max_eval_samples} samples")
+        eval_dataset = eval_dataset.select(range(min(len(eval_dataset), args.max_eval_samples)))
     
     # Format datasets
     train_dataset = train_dataset.map(
