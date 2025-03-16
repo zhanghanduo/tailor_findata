@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Run training with memory optimization settings
-python train/train_phi4.py \
+python train/train_lora.py \
   --model_name "unsloth/phi-4" \
   --dataset_name "christlurker/findata_test" \
   --output_dir "outputs/phi4-finqa2" \

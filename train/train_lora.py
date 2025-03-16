@@ -17,6 +17,60 @@ from transformers import (
 import torch
 
 
+def apply_custom_chat_template(tokenizer, chat_template_name):
+    """
+    Apply custom chat templates for models that might not be directly supported by unsloth.
+    
+    Args:
+        tokenizer: The tokenizer to modify
+        chat_template_name: The name of the chat template to apply
+        
+    Returns:
+        The modified tokenizer with the custom chat template
+    """
+    # Qwen2.5 chat template
+    if chat_template_name.lower() == "qwen":
+        # Qwen2.5 uses a specific chat template format
+        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}<|im_start|>system
+{{ message['content'] }}<|im_end|>
+{% elif message['role'] == 'user' %}<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{% elif message['role'] == 'assistant' %}<|im_start|>assistant
+{{ message['content'] }}<|im_end|>
+{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
+{% endif %}"""
+        tokenizer.chat_template = chat_template
+        print(f"Applied custom Qwen chat template")
+        return tokenizer
+    
+    # Yi chat template
+    elif chat_template_name.lower() == "yi":
+        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}<|im_start|>system
+{{ message['content'] }}<|im_end|>
+{% elif message['role'] == 'user' %}<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{% elif message['role'] == 'assistant' %}<|im_start|>assistant
+{{ message['content'] }}<|im_end|>
+{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
+{% endif %}"""
+        tokenizer.chat_template = chat_template
+        print(f"Applied custom Yi chat template")
+        return tokenizer
+    
+    # Claude chat template
+    elif chat_template_name.lower() == "claude":
+        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}
+{% elif message['role'] == 'user' %}Human: {{ message['content'] }}
+{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}
+{% endif %}{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"""
+        tokenizer.chat_template = chat_template
+        print(f"Applied custom Claude chat template")
+        return tokenizer
+    
+    # Return None if no custom template was applied
+    return None
+
+
 system_prompt = """Your role is to solve financial questions by generating both the program tokens that represent the calculation and the final answer. 
 For each question, ONLY provide:
 1. The program tokens that represent the calculation using <begin_of_program> and <end_of_program> tags
@@ -42,8 +96,19 @@ IMPORTANT:
 - Never omit any part of the format
 - Always end program tokens with the EOF token
 - The answer should be ONLY the numerical result without any additional text, units, or explanations
+- The numerical result must be a single number with no line breaks, spaces, or extra characters
+- Format decimal numbers properly (e.g., 44.0 not 44\n0)
 - DO NOT include any financial context, table data, or explanations in your response
 - DO NOT include any text outside of the specified tags
+
+Examples of correct answer formats:
+<begin_of_answer>
+44.0
+<end_of_answer>
+
+<begin_of_answer>
+-1889.0
+<end_of_answer>
 
 Your response should ONLY contain the program tokens and answer within their respective tags.
 """
@@ -77,6 +142,7 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Maximum number of samples to use for evaluation")
     parser.add_argument("--force_dataset_download", action="store_true", default=False, help="Force redownload of dataset instead of using cache")
+    parser.add_argument("--chat_template", type=str, default=None, help="Chat template to use (e.g., 'phi-4', 'llama-2', 'gemma', 'qwen', 'claude', 'phi-2', 'falcon', 'chatml'). If not specified, will be auto-detected based on model name.")
     args = parser.parse_args()
     
     # Ensure max_steps has a valid value
@@ -105,6 +171,7 @@ def setup_wandb(args):
         "gradient_checkpointing": args.gradient_checkpointing,
         "max_eval_samples": args.max_eval_samples,
         "force_dataset_download": args.force_dataset_download,
+        "chat_template": args.chat_template,
     }
     
     run_name = args.wandb_run_name or f"phi4-lora-r{args.lora_r}-bs{args.batch_size*args.gradient_accumulation_steps}"
@@ -137,6 +204,27 @@ def validate_format(text):
                 is_valid = False
                 break
     
+    # Check for common formatting issues in answers
+    if answer_match and is_valid:
+        answer_text = answer_match.group(1).strip()
+        
+        # Check for line breaks in the answer
+        if '\n' in answer_text:
+            is_valid = False
+        
+        # Check for multiple spaces in the answer
+        if '  ' in answer_text:
+            is_valid = False
+        
+        # Check for invalid numerical format (should be a clean number)
+        # Valid formats: 123, 123.45, -123, -123.45
+        if not re.match(r'^-?\d+\.?\d*$', answer_text):
+            # Allow for some common formatting that can be normalized
+            # e.g., with currency symbols or commas
+            normalized = answer_text.replace('$', '').replace(',', '').replace('%', '')
+            if not re.match(r'^-?\d+\.?\d*$', normalized):
+                is_valid = False
+    
     return is_valid
 
 
@@ -165,8 +253,59 @@ def load_model_and_tokenizer(args):
         loftq_config=None,
     )
     
-    # Set chat template
-    tokenizer = get_chat_template(tokenizer, chat_template="phi-4")
+    # Use chat template from args if provided, otherwise auto-detect
+    if args.chat_template:
+        chat_template = args.chat_template
+        print(f"Using user-specified chat template: {chat_template}")
+    else:
+        # Set chat template based on model type
+        model_name_lower = args.model_name.lower()
+        
+        # Detect model type and set appropriate chat template
+        if "phi-4" in model_name_lower or "phi4" in model_name_lower:
+            chat_template = "phi-4"
+        elif "qwen2" in model_name_lower or "qwen-2" in model_name_lower:
+            chat_template = "qwen"
+        elif "llama" in model_name_lower or "mistral" in model_name_lower:
+            chat_template = "llama-2"
+        elif "gemma" in model_name_lower:
+            chat_template = "gemma"
+        elif "phi-2" in model_name_lower or "phi2" in model_name_lower:
+            chat_template = "phi-2"
+        elif "falcon" in model_name_lower:
+            chat_template = "falcon"
+        elif "claude" in model_name_lower:
+            chat_template = "claude"
+        else:
+            # Default to chatml format which works for many models
+            chat_template = "chatml"
+        
+        print(f"Auto-detected chat template: {chat_template} for model: {args.model_name}")
+    
+    try:
+        # First try to apply a custom chat template
+        custom_tokenizer = apply_custom_chat_template(tokenizer, chat_template)
+        
+        # If a custom template was applied, use that tokenizer
+        if custom_tokenizer is not None:
+            tokenizer = custom_tokenizer
+        else:
+            # Otherwise, use the unsloth chat template function
+            tokenizer = get_chat_template(tokenizer, chat_template=chat_template)
+    except Exception as e:
+        print(f"Warning: Failed to apply chat template '{chat_template}': {e}")
+        print("Falling back to default chat template 'chatml'")
+        try:
+            # Try custom template first
+            custom_tokenizer = apply_custom_chat_template(tokenizer, "chatml")
+            if custom_tokenizer is not None:
+                tokenizer = custom_tokenizer
+            else:
+                # Fall back to unsloth's implementation
+                tokenizer = get_chat_template(tokenizer, chat_template="chatml")
+        except Exception as e2:
+            print(f"Warning: Also failed to apply fallback template: {e2}")
+            print("Proceeding with original tokenizer without chat template")
     
     return model, tokenizer
 
@@ -507,16 +646,27 @@ def get_compute_metrics_fn(tokenizer):
                         solution = solution.replace('$', '')
                         solution = solution.replace(',', '')
                         
+                        # Clean up line breaks and extra spaces
+                        solution = re.sub(r'\s+', ' ', solution).strip()
+                        
                         # Try to convert to float for numerical comparison
                         try:
                             # Check if the solution contains only digits, decimal point, and minus sign
+                            # More robust pattern that handles potential line breaks and spaces
                             if re.match(r'^-?\d+\.?\d*$', solution):
                                 return float(solution)
                             else:
                                 # If it contains other characters, it's likely a string answer
                                 return solution.lower()  # Normalize case for string comparison
                         except ValueError:
-                            # If conversion fails, return as string
+                            # If conversion fails, try to extract just the numerical part
+                            numerical_match = re.search(r'(-?\d+\.?\d*)', solution)
+                            if numerical_match:
+                                try:
+                                    return float(numerical_match.group(1))
+                                except ValueError:
+                                    pass
+                            # Return as string if all else fails
                             return solution.lower()
                     
                     # If standard format not found, try to find numerical answers in the text
@@ -594,6 +744,30 @@ def get_compute_metrics_fn(tokenizer):
             for i, (pred, label) in enumerate(zip(pred_answers, label_answers)):
                 match = False
                 reason = "No match"
+                
+                # Try to convert string predictions to float if they look numerical
+                if isinstance(pred, str) and isinstance(label, float):
+                    try:
+                        # Clean up the string and try to convert
+                        pred_clean = re.sub(r'\s+', '', pred)  # Remove all whitespace
+                        pred_clean = re.sub(r'[^\d.-]', '', pred_clean)  # Keep only digits, decimal point, and minus
+                        if pred_clean:
+                            pred = float(pred_clean)
+                            print(f"  Converted string '{pred}' to float {pred}")
+                    except ValueError:
+                        pass
+                
+                # Try to convert string labels to float if they look numerical
+                if isinstance(label, str) and isinstance(pred, float):
+                    try:
+                        # Clean up the string and try to convert
+                        label_clean = re.sub(r'\s+', '', label)  # Remove all whitespace
+                        label_clean = re.sub(r'[^\d.-]', '', label_clean)  # Keep only digits, decimal point, and minus
+                        if label_clean:
+                            label = float(label_clean)
+                            print(f"  Converted string '{label}' to float {label}")
+                    except ValueError:
+                        pass
                 
                 if isinstance(pred, float) and isinstance(label, float):
                     # Numerical comparison with tolerance
@@ -971,6 +1145,7 @@ def main():
     print(f"  - Max eval samples: {args.max_eval_samples}")
     print(f"  - Max sequence length: {args.max_seq_length}")
     print(f"  - Force dataset download: {args.force_dataset_download}")
+    print(f"  - Chat template: {args.chat_template if args.chat_template else 'Auto-detect'}")
     
     # Setup wandb
     wandb_run = setup_wandb(args)
