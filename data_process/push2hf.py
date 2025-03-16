@@ -2,6 +2,4 @@ from datasets import load_from_disk
 import huggingface_hub
 
 dataset = load_from_disk("processed_data/convfinqa_sharegpt_refine")
-dataset.push_to_hub("christlurker/finqa_sharegpt")
-
-huggingface_hub.create_tag("christlurker/finqa_sharegpt", tag="v1.2", repo_type="dataset")
+dataset.push_to_hub("christlurker/findata_test")

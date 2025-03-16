@@ -54,7 +54,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Phi-4 with LoRA")
     parser.add_argument("--model_name", type=str, default="unsloth/phi-4", help="Base model to fine-tune")
     parser.add_argument("--cache_dir", type=str, default="/workspace/mnt/watt/public_models", help="Cache directory for models")
-    parser.add_argument("--dataset_name", type=str, default="christlurker/finqa_sharegpt", help="Dataset to use for training")
+    parser.add_argument("--dataset_name", type=str, default="christlurker/findata_test", help="Dataset to use for training")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory to save model checkpoints")
     parser.add_argument("--max_seq_length", type=int, default=4096, help="Maximum sequence length")
     parser.add_argument("--load_in_4bit", action="store_true", default=True, help="Whether to load in 4-bit quantization")
