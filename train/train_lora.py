@@ -1271,7 +1271,7 @@ def train_model(trainer):
                 metrics["train/epoch"] = trainer_stats.epoch
                 
             # Add padding and truncation settings
-            metrics["train/max_length"] = trainer.args.max_length
+            metrics["train/max_seq_length"] = trainer.args.max_seq_length
             metrics["train/padding"] = getattr(trainer.args, "padding", "unknown")
             metrics["train/truncation"] = getattr(trainer.args, "truncation", "unknown")
                 

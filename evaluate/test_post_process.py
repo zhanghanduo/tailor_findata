@@ -65,6 +65,17 @@ divide( add( add( 55.9 59.4 ) 62.8 ) 3 ) EOF
 <end_of_answer>
 """
 
+# Sample model output with parenthesis issue
+sample_output_parenthesis_issue = """
+<begin_of_program>
+add ( 320 177 ) EOF
+<end_of_program>
+
+<begin_of_answer>
+497
+<end_of_answer>
+"""
+
 # Test extraction functions
 def test_extraction():
     print("Testing program token extraction...")
@@ -80,6 +91,10 @@ def test_extraction():
     # Test complex program
     complex_program_tokens = extract_program_tokens(sample_output_complex)
     print(f"Complex program tokens: {complex_program_tokens}")
+    
+    # Test parenthesis issue
+    parenthesis_issue_tokens = extract_program_tokens(sample_output_parenthesis_issue)
+    print(f"Parenthesis issue tokens: {parenthesis_issue_tokens}")
     
     print("\nTesting answer extraction...")
     

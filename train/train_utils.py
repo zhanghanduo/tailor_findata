@@ -57,6 +57,33 @@ def apply_custom_chat_template(tokenizer, chat_template_name):
         print(f"Applied custom Claude chat template")
         return tokenizer
     
+    # Gemma-3 chat template
+    elif chat_template_name.lower() == "gemma-3" or chat_template_name.lower() == "gemma3":
+        chat_template = """<bos>{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}
+{% elif message['role'] == 'user' %}<start_of_turn>user
+{{ message['content'] }}<end_of_turn>
+{% elif message['role'] == 'assistant' %}<start_of_turn>model
+{{ message['content'] }}<end_of_turn>
+{% endif %}{% endfor %}{% if add_generation_prompt %}<start_of_turn>model
+{% endif %}"""
+        tokenizer.chat_template = chat_template
+        print(f"Applied custom Gemma-3 chat template with <start_of_turn> format")
+        return tokenizer
+    
+    # Llama 3.1 chat template
+    elif chat_template_name.lower() == "llama-3.1" or chat_template_name.lower() == "llama3.1" or "llama-3.1" in chat_template_name.lower():
+        chat_template = """{% for message in messages %}{% if message['role'] == 'system' %}<|system|>
+{{ message['content'] }}
+{% elif message['role'] == 'user' %}<|user|>
+{{ message['content'] }}
+{% elif message['role'] == 'assistant' %}<|assistant|>
+{{ message['content'] }}
+{% endif %}{% endfor %}{% if add_generation_prompt %}<|assistant|>
+{% endif %}"""
+        tokenizer.chat_template = chat_template
+        print(f"Applied custom Llama 3.1 chat template")
+        return tokenizer
+    
     # Return None if no custom template was applied
     return None
 
@@ -160,8 +187,21 @@ def debug_tokenized_dataset(tokenizer, dataset, num_samples=2):
             user_marker = "<|im_start|>user"
             assistant_marker = "<|im_start|>assistant"
             
+            # For Gemma-3, also check for its specific markers
+            gemma_user_marker = "<start_of_turn>user"
+            gemma_assistant_marker = "<start_of_turn>model"
+            
             user_pos = text.find(user_marker)
             assistant_pos = text.find(assistant_marker)
+            
+            # If standard markers not found, try Gemma-3 markers
+            if user_pos < 0:
+                user_pos = text.find(gemma_user_marker)
+                user_marker = gemma_user_marker
+            
+            if assistant_pos < 0:
+                assistant_pos = text.find(gemma_assistant_marker)
+                assistant_marker = gemma_assistant_marker
             
             print(f"User marker position: {user_pos}")
             print(f"Assistant marker position: {assistant_pos}")
@@ -173,8 +213,8 @@ def debug_tokenized_dataset(tokenizer, dataset, num_samples=2):
                 print("❌ Markers not found in correct order")
             
             # Try to manually apply train_on_responses_only logic
-            instruction_part = "<|im_start|>user\n"
-            response_part = "<|im_start|>assistant\n"
+            instruction_part = user_marker + "\n"
+            response_part = assistant_marker + "\n"
             
             instruction_pos = text.find(instruction_part)
             response_pos = text.find(response_part)
@@ -229,8 +269,11 @@ def custom_train_on_responses_only(trainer, tokenizer, instruction_part, respons
         print("Dataset is already tokenized. Applying response-only training directly on tokenized data.")
         
         # For tokenized datasets, we need to find the token IDs for the markers
-        instruction_tokens = tokenizer.encode(instruction_part, add_special_tokens=False)
-        response_tokens = tokenizer.encode(response_part, add_special_tokens=False)
+        instruction_tokenized = tokenizer(instruction_part, add_special_tokens=False, return_tensors="pt")
+        instruction_tokens = instruction_tokenized["input_ids"][0].tolist()
+        
+        response_tokenized = tokenizer(response_part, add_special_tokens=False, return_tensors="pt")
+        response_tokens = response_tokenized["input_ids"][0].tolist()
         
         print(f"Instruction token IDs: {instruction_tokens}")
         print(f"Response token IDs: {response_tokens}")
@@ -296,11 +339,13 @@ def custom_train_on_responses_only(trainer, tokenizer, instruction_part, respons
             # Check if we have any non-masked labels
             if "labels" in example and all(label == -100 for label in example["labels"]):
                 print(f"Example {i}: All labels are masked!")
-            else:
+            elif "labels" in example:
                 print(f"Example {i}: Labels contain non-masked values")
                 # Count non-masked labels
                 non_masked = sum(1 for label in example["labels"] if label != -100)
                 print(f"  - Non-masked labels: {non_masked} out of {len(example['labels'])}")
+            else:
+                print(f"Example {i}: No 'labels' key found in example. Available keys: {list(example.keys())}")
     else:
         # Function to process a single example with text
         def process_example(example):
@@ -327,9 +372,15 @@ def custom_train_on_responses_only(trainer, tokenizer, instruction_part, respons
             input_ids = tokenized["input_ids"][0]
             
             # Find token indices for the markers
-            full_text_tokens = tokenizer.encode(text)
-            instruction_tokens = tokenizer.encode(instruction_part)
-            response_tokens = tokenizer.encode(response_part)
+            # Use tokenizer() instead of encode for Gemma3Processor compatibility
+            full_text_tokenized = tokenizer(text, return_tensors="pt")
+            full_text_tokens = full_text_tokenized["input_ids"][0].tolist()
+            
+            instruction_tokenized = tokenizer(instruction_part, return_tensors="pt")
+            instruction_tokens = instruction_tokenized["input_ids"][0].tolist()
+            
+            response_tokenized = tokenizer(response_part, return_tensors="pt")
+            response_tokens = response_tokenized["input_ids"][0].tolist()
             
             # Find the position of instruction and response in the tokenized text
             instruction_token_pos = -1
@@ -353,7 +404,8 @@ def custom_train_on_responses_only(trainer, tokenizer, instruction_part, respons
                 print(f"Warning: Could not find token positions for markers. Using text positions instead.")
                 # Tokenize the text up to the response part
                 prefix_text = text[:response_pos]
-                prefix_tokens = tokenizer.encode(prefix_text)
+                prefix_tokenized = tokenizer(prefix_text, return_tensors="pt")
+                prefix_tokens = prefix_tokenized["input_ids"][0].tolist()
                 response_token_pos = len(prefix_tokens)
             
             # Create labels: -100 for non-response tokens, actual token IDs for response tokens
@@ -392,11 +444,13 @@ def custom_train_on_responses_only(trainer, tokenizer, instruction_part, respons
             # Check if we have any non-masked labels
             if "labels" in example and all(label == -100 for label in example["labels"]):
                 print(f"Example {i}: All labels are masked!")
-            else:
+            elif "labels" in example:
                 print(f"Example {i}: Labels contain non-masked values")
                 # Count non-masked labels
                 non_masked = sum(1 for label in example["labels"] if label != -100)
                 print(f"  - Non-masked labels: {non_masked} out of {len(example['labels'])}")
+            else:
+                print(f"Example {i}: No 'labels' key found in example. Available keys: {list(example.keys())}")
     
     print("===== CUSTOM TRAIN_ON_RESPONSES_ONLY APPLIED =====\n")
     return trainer
@@ -596,8 +650,12 @@ def get_chat_template_name(model_name):
         return "phi-4"
     elif "qwen2" in model_name_lower or "qwen-2" in model_name_lower:
         return "qwen"
+    elif "llama-3.1" in model_name_lower or "llama3.1" in model_name_lower:
+        return "llama-3.1"
     elif "llama" in model_name_lower or "mistral" in model_name_lower:
         return "llama-2"
+    elif "gemma-3" in model_name_lower or "gemma3" in model_name_lower:
+        return "gemma-3"
     elif "gemma" in model_name_lower:
         return "gemma"
     elif "phi-2" in model_name_lower or "phi2" in model_name_lower:
