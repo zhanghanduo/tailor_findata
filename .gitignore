@@ -7,5 +7,12 @@ pip-cache/
 data/train.json
 data/dev.json
 processed_data/
+output/
+logs/
+rag_system.egg-info/
+_pycache_/
+rag_system/__pycache__/
+rag_system/models/__pycache__/
+rag_system/utils/__pycache__/
 
 
