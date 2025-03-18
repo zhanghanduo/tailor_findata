@@ -9,14 +9,20 @@ NC='\033[0m' # No Color
 
 echo -e "${GREEN}Setting up Financial RAG Evaluation System${NC}"
 
-# Create virtual environment
-echo -e "${YELLOW}Creating Python virtual environment...${NC}"
-python -m venv venv
-source venv/bin/activate
+# Check if uv is installed
+if ! command -v uv &> /dev/null; then
+    echo -e "${YELLOW}Installing uv...${NC}"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
 
-# Install dependencies
+# Create virtual environment using uv
+echo -e "${YELLOW}Creating Python virtual environment...${NC}"
+uv venv
+source .venv/bin/activate
+
+# Install dependencies using uv
 echo -e "${YELLOW}Installing dependencies...${NC}"
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 
 # Create necessary directories
 echo -e "${YELLOW}Creating directories...${NC}"
@@ -50,7 +56,7 @@ chmod +x examples/openai_integration.py
 echo -e "${GREEN}Setup complete!${NC}"
 echo ""
 echo -e "To run the evaluation, activate the virtual environment and execute:"
-echo -e "  source venv/bin/activate"
+echo -e "  source .venv/bin/activate"
 echo -e "  python run.py"
 echo ""
 echo -e "To run with custom paths:"

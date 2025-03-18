@@ -18,6 +18,7 @@ This RAG system is specifically designed to work with financial data from annual
 
 - Python 3.8+
 - OpenAI API key
+- uv (Python virtual environment manager)
 
 ### Installation
 
@@ -27,12 +28,22 @@ git clone <repository-url>
 cd <repository-name>
 ```
 
-2. Install dependencies:
+2. Install uv if you haven't already:
 ```bash
-pip install -r requirements_rag.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-3. Set up your OpenAI API key:
+3. Set up the environment and install dependencies:
+```bash
+# Create virtual environment and install dependencies
+uv venv
+source .venv/bin/activate  # On Unix/macOS
+# or
+.venv\Scripts\activate  # On Windows
+uv pip install -r requirements_rag.txt
+```
+
+4. Set up your OpenAI API key:
 ```bash
 # Create a .env file with your API key
 echo "OPENAI_API_KEY=your_api_key_here" > .env
