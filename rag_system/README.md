@@ -99,7 +99,7 @@ python -m rag_system.example
 Key configuration parameters in `config.py`:
 
 - `EMBEDDING_MODEL`: Model for embeddings (default: "BAAI/bge-small-en-v1.5")
-- `LLM_MODEL`: LLM model for query processing (default: "gpt-3.5-turbo")
+- `LLM_MODEL`: LLM model for query processing (default: "gpt-4o-mini-turbo")
 - `CHUNK_SIZE`: Size of text chunks (default: 512)
 - `CHUNK_OVERLAP`: Overlap between chunks (default: 50)
 - `TABLE_DETECTION_THRESHOLD`: Threshold for detecting tables (default: 2)

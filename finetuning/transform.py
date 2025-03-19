@@ -105,6 +105,7 @@ def transform_to_markdown(input_file, output_file):
             pre_text = ""
             post_text = ""
             formatted_table = ""
+            original_table_data = []
             
             # First check if the sample has the annotation field
             if "annotation" in sample:
@@ -125,20 +126,33 @@ def transform_to_markdown(input_file, output_file):
             if not formatted_table and "table" in sample:
                 table_data = sample.get("table", [])
                 formatted_table = format_table_for_llm(table_data)
+                original_table_data = table_data
             elif not formatted_table and "table_ori" in sample:
                 table_data = sample.get("table_ori", [])
                 formatted_table = format_table_for_llm(table_data)
+                original_table_data = table_data
             
             # Write to markdown file
             f.write(f'# {doc_id}\n\n')
             
+            # Write full content first
+            f.write('## Content\n\n')
+            f.write(f'{pre_text}\n\n{formatted_table}\n\n{post_text}\n\n')
+            
+            # Write individual components
             if pre_text:
                 f.write('## Pre-text\n\n')
                 f.write(f'{pre_text}\n\n')
             
             if formatted_table:
-                f.write('## Table\n\n')
+                f.write('## Table (Markdown Format)\n\n')
                 f.write(f'{formatted_table}\n\n')
+            
+            if original_table_data:
+                f.write('## Table (Array Format)\n\n')
+                f.write('```json\n')
+                f.write(json.dumps(original_table_data, indent=2))
+                f.write('\n```\n\n')
             
             if post_text:
                 f.write('## Post-text\n\n')
@@ -169,14 +183,15 @@ def transform_to_json(input_file, output_file):
         pre_text = ""
         post_text = ""
         formatted_table = ""
+        original_table_data = []
         
         # First check if the sample has the annotation field
-        if "annotation" in sample:
-            annos = sample['annotation']
-            pre_text = annos.get('amt_pre_text', '')
-            post_text = annos.get('amt_post_text', '')
-            html_table = annos.get('amt_table', '').replace('<td></td>', '<td>-</td>')
-            formatted_table = format_html_table_for_llm(html_table)
+        # if "annotation" in sample:
+        #     annos = sample['annotation']
+        #     pre_text = annos.get('amt_pre_text', '')
+        #     post_text = annos.get('amt_post_text', '')
+        #     html_table = annos.get('amt_table', '').replace('<td></td>', '<td>-</td>')
+        #     formatted_table = format_html_table_for_llm(html_table)
         
         # If annotation doesn't have the required fields or doesn't exist,
         # check if the sample has the direct fields
@@ -189,14 +204,20 @@ def transform_to_json(input_file, output_file):
         if not formatted_table and "table" in sample:
             table_data = sample.get("table", [])
             formatted_table = format_table_for_llm(table_data)
+            original_table_data = table_data
         elif not formatted_table and "table_ori" in sample:
             table_data = sample.get("table_ori", [])
             formatted_table = format_table_for_llm(table_data)
+            original_table_data = table_data
         
-        # Create document for RAG - simplified structure
+        # Create document for RAG - modified structure with decoupled fields
         document = {
             "id": doc_id,
             "content": f"{pre_text}\n\n{formatted_table}\n\n{post_text}".strip(),
+            "pre_text": pre_text,
+            "post_text": post_text,
+            "table_markdown": formatted_table,
+            "table_data": original_table_data,
             "metadata": {
                 "source": "ConvFinQA",
                 "filename": sample.get("filename", "")

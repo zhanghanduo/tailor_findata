@@ -1,8 +1,8 @@
 from typing import List, Dict, Any, Optional
 import logging
 import re
-from llama_index.llms import OpenAI
-from llama_index.prompts import PromptTemplate
+from llama_index.llms.openai import OpenAI
+from llama_index.core.prompts import PromptTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +62,22 @@ SUB_QUESTIONS_TEMPLATE = PromptTemplate(
     
 Original query: {query}
 
-Break this down into 2-4 simpler sub-questions that:
+First, determine if this query is simple enough to answer directly or needs to be broken down:
+- Simple queries ask for a specific fact, number, or piece of information.
+- Complex queries require understanding multiple pieces of information or performing calculations.
+
+If the query is SIMPLE, return exactly ONE sub-question that is identical to the original query.
+
+If the query is COMPLEX, break it down into 2-3 simpler sub-questions that:
 1. Focus on retrieving specific pieces of information needed to answer the original query
 2. Target specific tables or numerical data if needed
-3. Ask about contextual information that might be necessary
-4. Are clear and directly answerable from financial documents
+3. Are clear and directly answerable from financial documents
+
+When you answer:
+1. For numerical questions, provide exact numerical values with appropriate units
+2. If a percentage or specific number is requested, extract ONLY that value in your final answer
+3. For percentages, round to one decimal place (e.g., 14.1%, not 14.13%)
+4. Put the final numerical answer in <answer></answer> tags
 
 Sub-questions:"""
 )
@@ -76,7 +87,7 @@ class QueryTransformer:
     Class for transforming queries to improve retrieval performance.
     """
     
-    def __init__(self, model_name: str = "gpt-3.5-turbo", temperature: float = 0.1):
+    def __init__(self, model_name: str = "gpt-4o-mini", temperature: float = 0.1):
         """
         Initialize the query transformer.
         
@@ -85,6 +96,19 @@ class QueryTransformer:
             temperature: Temperature setting for the LLM.
         """
         self.llm = OpenAI(model=model_name, temperature=temperature)
+    
+    def transform(self, query: str) -> str:
+        """
+        Transform a query to make it more effective for retrieval.
+        This is a wrapper around rewrite_query for compatibility.
+        
+        Args:
+            query: Original user query.
+            
+        Returns:
+            Transformed query.
+        """
+        return self.rewrite_query(query)
     
     def rewrite_query(self, query: str) -> str:
         """

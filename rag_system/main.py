@@ -1,6 +1,7 @@
 import os
 import logging
 import argparse
+import re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
@@ -14,7 +15,7 @@ from rag_system.config import (
 from rag_system.utils.data_loader import load_financial_data, preprocess_data
 from rag_system.utils.custom_chunker import FinancialTextSplitter, create_hierarchical_nodes
 from rag_system.models.index_builder import FinancialIndexBuilder
-from rag_system.models.retriever import FinancialRetriever
+from rag_system.models.hybrid_retriever import HybridFinancialRetriever
 from rag_system.models.sub_question_engine import FinancialSubQuestionEngine
 
 # Set up logging
@@ -36,7 +37,9 @@ class FinancialRAGSystem:
         embedding_model: str = EMBEDDING_MODEL,
         llm_model: str = LLM_MODEL,
         temperature: float = TEMPERATURE,
-        rebuild_indices: bool = False
+        rebuild_indices: bool = False,
+        vector_weight: float = 0.6,
+        bm25_weight: float = 0.4
     ):
         """
         Initialize the Financial RAG system.
@@ -48,6 +51,8 @@ class FinancialRAGSystem:
             llm_model: Name of the LLM model to use.
             temperature: Temperature setting for the LLM.
             rebuild_indices: Whether to rebuild indices even if they exist.
+            vector_weight: Weight for vector search (0-1).
+            bm25_weight: Weight for BM25 search (0-1).
         """
         # Load environment variables
         load_dotenv()
@@ -61,6 +66,8 @@ class FinancialRAGSystem:
         self.llm_model = llm_model
         self.temperature = temperature
         self.rebuild_indices = rebuild_indices
+        self.vector_weight = vector_weight
+        self.bm25_weight = bm25_weight
         
         # Initialize LLM
         self.llm = OpenAI(model=llm_model, temperature=temperature)
@@ -179,29 +186,36 @@ class FinancialRAGSystem:
         
         return self.indices
     
-    def initialize_retriever(self) -> FinancialRetriever:
+    def initialize_retriever(self) -> HybridFinancialRetriever:
         """
-        Initialize the retriever.
+        Initialize the hybrid retriever.
         
         Returns:
-            FinancialRetriever object.
+            HybridFinancialRetriever object.
         """
-        logger.info("Initializing retriever")
+        logger.info("Initializing hybrid retriever")
         
         # Ensure indices are built or loaded
         if not self.indices:
             self.build_or_load_indices()
         
-        # Create retriever
-        self.retriever = FinancialRetriever(
-            text_index=self.indices["text_index"],
-            table_index=self.indices["table_index"],
-            context_index=self.indices["context_index"],
+        # Create hybrid retriever
+        self.retriever = HybridFinancialRetriever(
+            pre_text_index=self.indices["pre_text"],
+            post_text_index=self.indices["post_text"],
+            table_index=self.indices["table"],
             llm=self.llm,
             similarity_top_k=SIMILARITY_TOP_K,
-            rerank_top_n=RERANK_TOP_N
+            rerank_top_n=RERANK_TOP_N,
+            vector_weight=self.vector_weight,
+            bm25_weight=self.bm25_weight
         )
         
+        # Force refresh collections to ensure all documents are available
+        logger.info("Forcing collection refresh to ensure data availability")
+        self.retriever.refresh_collections()
+        
+        logger.info(f"Hybrid retriever initialized with vector weight: {self.vector_weight}, BM25 weight: {self.bm25_weight}")
         return self.retriever
     
     def initialize_sub_question_engine(self) -> FinancialSubQuestionEngine:
@@ -219,12 +233,15 @@ class FinancialRAGSystem:
         
         # Create sub-question engine
         self.sub_question_engine = FinancialSubQuestionEngine(
-            text_index=self.indices["text_index"],
-            table_index=self.indices["table_index"],
-            context_index=self.indices["context_index"],
-            llm=self.llm
+            pre_text_index=self.indices["pre_text"],
+            post_text_index=self.indices["post_text"],
+            table_index=self.indices["table"],
+            llm=self.llm,
+            vector_weight=self.vector_weight,
+            bm25_weight=self.bm25_weight
         )
         
+        logger.info(f"Sub-question engine initialized with vector weight: {self.vector_weight}, BM25 weight: {self.bm25_weight}")
         return self.sub_question_engine
     
     def retrieve(self, query: str, use_query_transformation: bool = True) -> Dict[str, Any]:
@@ -247,17 +264,21 @@ class FinancialRAGSystem:
         # Perform retrieval
         return self.retriever.retrieve(query, use_query_transformation)
     
-    def query(self, query: str) -> Dict[str, Any]:
+    def query(self, query: str, concise_output: bool = False) -> Dict[str, Any]:
         """
         Process a query with the sub-question engine.
         
         Args:
             query: User query.
+            concise_output: Whether to return a concise output (just the answer).
             
         Returns:
             Dictionary containing query results.
         """
         logger.info(f"Processing query: {query}")
+        
+        if concise_output:
+            return self.concise_query(query)
         
         # Ensure sub-question engine is initialized
         if not self.sub_question_engine:
@@ -276,6 +297,54 @@ class FinancialRAGSystem:
             return self.sub_question_engine.query_with_numerical_operations(query)
         else:
             return self.sub_question_engine.query(query)
+    
+    def concise_query(self, query: str) -> Dict[str, Any]:
+        """
+        Process a query to provide a direct, concise answer.
+        
+        Args:
+            query: User query.
+            
+        Returns:
+            Dictionary containing a concise answer in the format:
+            {"qa": {"question": "original question", "answer": "direct answer"}}
+        """
+        logger.info(f"Processing concise query: {query}")
+        
+        # Ensure sub-question engine is initialized
+        if not self.sub_question_engine:
+            self.initialize_sub_question_engine()
+        
+        # Check if query is numerical in nature
+        has_numerical_terms = any(term in query.lower() for term in [
+            "calculate", "compute", "sum", "average", "mean", "total", "difference",
+            "percent", "percentage", "ratio", "compare", "growth", "increase", "decrease"
+        ])
+        
+        # Get the full response
+        if has_numerical_terms:
+            result = self.sub_question_engine.query_with_numerical_operations(query)
+        else:
+            result = self.sub_question_engine.query(query)
+        
+        # Extract the direct answer from the response
+        answer = result.get("response", "")
+        
+        # Look for an answer in <answer> tags
+        answer_match = re.search(r"<answer>(.*?)</answer>", answer)
+        if answer_match:
+            direct_answer = answer_match.group(1).strip()
+        else:
+            # If no tagged answer, use the full response as a fallback
+            direct_answer = answer
+        
+        # Return in the requested format
+        return {
+            "qa": {
+                "question": query,
+                "answer": direct_answer
+            }
+        }
     
     def initialize(self) -> None:
         """
@@ -309,7 +378,11 @@ def parse_args():
     parser.add_argument("--llm_model", type=str, default=LLM_MODEL, help="Name of the LLM model to use")
     parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="Temperature setting for the LLM")
     parser.add_argument("--rebuild_indices", action="store_true", help="Whether to rebuild indices even if they exist")
+    parser.add_argument("--force_bm25_refresh", action="store_true", help="Force refresh of BM25 retrievers")
     parser.add_argument("--query", type=str, help="Query to process")
+    parser.add_argument("--vector_weight", type=float, default=0.6, help="Weight for vector search (0-1)")
+    parser.add_argument("--bm25_weight", type=float, default=0.4, help="Weight for BM25 search (0-1)")
+    parser.add_argument("--concise", action="store_true", help="Generate concise output format with just the answer")
     return parser.parse_args()
 
 def main():
@@ -323,28 +396,41 @@ def main():
         embedding_model=args.embedding_model,
         llm_model=args.llm_model,
         temperature=args.temperature,
-        rebuild_indices=args.rebuild_indices
+        rebuild_indices=args.rebuild_indices,
+        vector_weight=args.vector_weight,
+        bm25_weight=args.bm25_weight
     )
     
     # Initialize system
     rag_system.initialize()
     
+    # Force refresh BM25 if requested
+    if args.force_bm25_refresh and rag_system.retriever:
+        print("Forcing BM25 retriever refresh...")
+        rag_system.retriever.refresh_collections()
+        print("BM25 retrievers refreshed successfully")
+    
     # Process query if provided
     if args.query:
-        result = rag_system.query(args.query)
-        print("\nQuery:", args.query)
-        print("\nResponse:", result["response"])
-        
-        # Print sub-questions if available
-        if result.get("sub_questions"):
-            print("\nSub-questions:")
-            for i, sub_q in enumerate(result["sub_questions"]):
-                print(f"\n{i+1}. {sub_q['question']}")
-                print(f"   Answer: {sub_q['response']}")
-        
-        # Print numerical response if available
-        if result.get("numerical_response"):
-            print("\nNumerical analysis:", result["numerical_response"])
+        if args.concise:
+            result = rag_system.query(args.query, concise_output=True)
+            print("\nQuery:", result["qa"]["question"])
+            print("Answer:", result["qa"]["answer"])
+        else:
+            result = rag_system.query(args.query)
+            print("\nQuery:", args.query)
+            print("\nResponse:", result["response"])
+            
+            # Print sub-questions if available
+            if result.get("sub_questions"):
+                print("\nSub-questions:")
+                for i, sub_q in enumerate(result["sub_questions"]):
+                    print(f"\n{i+1}. {sub_q['question']}")
+                    print(f"   Answer: {sub_q['response']}")
+            
+            # Print numerical response if available
+            if result.get("numerical_response"):
+                print("\nNumerical analysis:", result["numerical_response"])
     else:
         print("System initialized successfully. Use --query to process a query.")
 

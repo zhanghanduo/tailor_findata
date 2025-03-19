@@ -12,4 +12,5 @@ matplotlib
 plotly
 llama-index-llms-openai
 llama-index-embeddings-huggingface
-llama-index-vector-stores-chroma 
+llama-index-vector-stores-chroma
+llama-index-retrievers-bm25

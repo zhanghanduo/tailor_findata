@@ -18,6 +18,7 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run inference on ConvFinQA test set")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the fine-tuned model")
+    parser.add_argument("--base_model_name", type=str, default=None, help="Name or path of the base model for PEFT adapters. If not provided, will try to infer from adapter_config.json")
     parser.add_argument("--test_data", type=str, required=True, help="Path to the test data (JSON file or processed dataset)")
     parser.add_argument("--output_dir", type=str, default="predictions", help="Directory to save predictions")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference")
@@ -138,6 +139,45 @@ def prepare_test_data(test_data_path):
             # Generate an example ID if not present
             example_id = example.get("id", f"example_{i}")
             
+            # Extract golden answer if available
+            golden_answer = ""
+            question = ""
+            
+            # Check for qa field
+            if "qa" in example and isinstance(example["qa"], dict):
+                if "answer" in example["qa"]:
+                    golden_answer = str(example["qa"]["answer"]) if example["qa"]["answer"] is not None else ""
+                if "question" in example["qa"]:
+                    question = str(example["qa"]["question"]) if example["qa"]["question"] is not None else ""
+            # Check for qa_0, qa_1, etc. fields
+            elif any(key.startswith("qa_") for key in example.keys()):
+                # Get all qa_* fields sorted numerically
+                qa_keys = sorted([k for k in example.keys() if k.startswith("qa_") and k[3:].isdigit()], 
+                                key=lambda x: int(x[3:]))
+                
+                # Use the first qa_* entry for the answer and question
+                if qa_keys and isinstance(example[qa_keys[0]], dict):
+                    first_qa = example[qa_keys[0]]
+                    if "answer" in first_qa:
+                        golden_answer = str(first_qa["answer"]) if first_qa["answer"] is not None else ""
+                    if "question" in first_qa:
+                        question = str(first_qa["question"]) if first_qa["question"] is not None else ""
+                    
+                    # Store all qa_* entries in a list under a single "qa" key
+                    all_qa_entries = []
+                    for qa_key in qa_keys:
+                        if isinstance(example[qa_key], dict):
+                            all_qa_entries.append(example[qa_key])
+                    
+                    # Replace the qa field with the combined list
+                    example["qa"] = {"entries": all_qa_entries}
+            # Fall back to direct answer/question fields
+            else:
+                if "answer" in example:
+                    golden_answer = str(example["answer"]) if example["answer"] is not None else ""
+                if "question" in example:
+                    question = str(example["question"]) if example["question"] is not None else ""
+            
             # Handle different data formats
             # Check if the example has the new format with pre_text, post_text, and table_ori
             if "pre_text" in example and "post_text" in example and "table_ori" in example:
@@ -150,9 +190,6 @@ def prepare_test_data(test_data_path):
                 # Format table
                 table_data = example.get("table_ori", [])
                 formatted_table = format_table_for_llm(table_data)
-                
-                # Get the question (if available)
-                question = example.get("question", "")
                 
                 # Create context
                 context = f'{pre_text}\n\n{formatted_table}\n\n{post_text}'
@@ -171,28 +208,61 @@ def prepare_test_data(test_data_path):
                 # Create context
                 context = f'{pre_text}\n\n{formatted_table}\n\n{post_text}'
                 
-                # Get the question (first turn of the conversation)
-                question = annos.get("dialogue_break", [""])[0] if annos.get("dialogue_break") else ""
+                # Get the question (first turn of the conversation) if not already set
+                if not question:
+                    question = annos.get("dialogue_break", [""])[0] if annos.get("dialogue_break") else ""
             
             # If neither format is present, use whatever is available
             else:
                 context = example.get("context", "")
-                question = example.get("question", "")
             
             test_examples.append({
-                "id": example_id,
-                "context": context,
-                "question": question
+                "id": str(example_id),
+                "context": str(context),
+                "question": str(question),
+                "answer": str(golden_answer),
+                "qa": json.dumps(example.get("qa", {})) if isinstance(example.get("qa"), dict) else str(example.get("qa", "{}"))
             })
         
         # Create a dataset from the examples
-        from datasets import Dataset
-        test_dataset = Dataset.from_list(test_examples)
+        from datasets import Dataset, Features, Value
+        
+        # Define explicit schema to prevent type inference issues
+        features = Features({
+            "id": Value("string"),
+            "context": Value("string"),
+            "question": Value("string"),
+            "answer": Value("string"),
+            "qa": Value("string")  # Convert the qa dict to string to avoid schema issues
+        })
+        
+        # Convert qa dictionaries to strings
+        for example in test_examples:
+            if isinstance(example["qa"], dict):
+                example["qa"] = json.dumps(example["qa"])
+        
+        test_dataset = Dataset.from_list(test_examples, features=features)
         
         # Debug: Print dataset info
         print(f"Created dataset with {len(test_dataset)} examples")
         print(f"Dataset features: {test_dataset.features}")
         print(f"First example: {test_dataset[0] if len(test_dataset) > 0 else 'No examples'}")
+    
+    # Randomly split the dataset to 1/5 of its original size
+    total_size = len(test_dataset)
+    subset_size = total_size // 5
+    
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Generate random indices for the subset
+    subset_indices = np.random.choice(total_size, size=subset_size, replace=False)
+    subset_indices = sorted(subset_indices)  # Sort indices for consistency
+    
+    # Select the subset
+    test_dataset = test_dataset.select(subset_indices)
+    
+    print(f"\nReduced dataset size from {total_size} to {len(test_dataset)} examples (1/5 random sample)")
     
     # Extract example IDs
     example_ids = [example["id"] for example in test_dataset] if "id" in test_dataset.column_names else [f"example_{i}" for i in range(len(test_dataset))]
@@ -320,10 +390,22 @@ def run_inference(model, tokenizer, test_dataset, args):
     print(f"Dataset length: {len(test_dataset)}")
     
     # Check if we're using a Gemma3 model
-    is_gemma3 = "gemma3" in args.model_path.lower()
+    is_gemma3 = "gemma3" in args.model_path.lower() or "gemma-3" in args.model_path.lower()
     
     # Check if we're using a Llama 3.3 model
     is_llama3_3 = "llama3.3" in args.model_path.lower() or "llama-3.3" in args.model_path.lower()
+    
+    # Check if we're using PEFT adapter
+    is_peft_model = hasattr(model, "get_base_model") and hasattr(model, "peft_config")
+    if is_peft_model:
+        print("Running inference with PEFT adapter model")
+        base_model_name = model.peft_config['default'].base_model_name_or_path.lower()
+        is_gemma3 = is_gemma3 or "gemma3" in base_model_name or "gemma-3" in base_model_name
+        is_llama3_3 = is_llama3_3 or "llama3.3" in base_model_name or "llama-3.3" in base_model_name
+        if is_gemma3:
+            print("Detected Gemma 3 as base model")
+        if is_llama3_3:
+            print("Detected Llama 3.3 as base model")
     
     # Process examples one by one to avoid batch processing issues
     for i in tqdm(range(len(test_dataset)), desc="Running inference"):
@@ -337,11 +419,55 @@ def run_inference(model, tokenizer, test_dataset, args):
             
             if isinstance(example, dict):
                 context = example.get("context", "")
-                question = example.get("question", "")
+                if "question" in example:
+                    question = example.get("question", "")
+                elif "qa" in example:
+                    # Check if qa is a string (JSON)
+                    if isinstance(example["qa"], str):
+                        try:
+                            qa_dict = json.loads(example["qa"])
+                            if isinstance(qa_dict, dict):
+                                if "question" in qa_dict:
+                                    question = qa_dict["question"]
+                                # Handle entries list from qa_0, qa_1 etc.
+                                elif "entries" in qa_dict and isinstance(qa_dict["entries"], list) and len(qa_dict["entries"]) > 0:
+                                    first_entry = qa_dict["entries"][0]
+                                    if isinstance(first_entry, dict) and "question" in first_entry:
+                                        question = first_entry["question"]
+                        except json.JSONDecodeError:
+                            pass
+                    # Check if qa is a dict
+                    elif isinstance(example["qa"], dict) and "question" in example["qa"]:
+                        question = example["qa"]["question"]
             else:
                 # Try to access as dataset item
-                context = test_dataset[i]["context"] if "context" in test_dataset.column_names else ""
-                question = test_dataset[i]["question"] if "question" in test_dataset.column_names else ""
+                if "context" in test_dataset.column_names:
+                    context = test_dataset[i]["context"]
+                
+                if "question" in test_dataset.column_names:
+                    question = test_dataset[i]["question"]
+                elif "qa" in test_dataset.column_names:
+                    # Check if qa is a string (JSON)
+                    if isinstance(test_dataset[i]["qa"], str):
+                        try:
+                            qa_dict = json.loads(test_dataset[i]["qa"])
+                            if isinstance(qa_dict, dict):
+                                if "question" in qa_dict:
+                                    question = qa_dict["question"]
+                                # Handle entries list from qa_0, qa_1 etc.
+                                elif "entries" in qa_dict and isinstance(qa_dict["entries"], list) and len(qa_dict["entries"]) > 0:
+                                    first_entry = qa_dict["entries"][0]
+                                    if isinstance(first_entry, dict) and "question" in first_entry:
+                                        question = first_entry["question"]
+                        except json.JSONDecodeError:
+                            pass
+                    # Check if qa is a dict
+                    elif isinstance(test_dataset[i]["qa"], dict) and "question" in test_dataset[i]["qa"]:
+                        question = test_dataset[i]["qa"]["question"]
+            
+            # Ensure context and question are strings
+            context = str(context) if context is not None else ""
+            question = str(question) if question is not None else ""
             
             # If question is empty, create a default financial analysis question
             if not question or question.strip() == "":
@@ -793,32 +919,104 @@ def main():
     try:
         # Load model and tokenizer
         print(f"Loading model from {args.model_path}")
-        if args.load_in_4bit:
-            # Load in 4-bit quantization
-            from transformers import BitsAndBytesConfig
-            
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16
-            )
-            
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_path,
-                device_map="auto",
-                quantization_config=bnb_config
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(args.model_path).to(args.device)
         
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        # Check if we're dealing with a PEFT adapter model
+        is_peft_model = os.path.exists(os.path.join(args.model_path, "adapter_config.json"))
+        
+        if is_peft_model:
+            print("Detected PEFT adapter model. Loading base model first...")
+            
+            # Check if PEFT is installed
+            try:
+                from peft import PeftModel, PeftConfig
+            except ImportError:
+                raise ImportError(
+                    "PEFT library is required to load adapter models but was not found. "
+                    "Please install it with: pip install peft"
+                )
+            
+            # Get the base model name, either from the argument or from the adapter config
+            if args.base_model_name:
+                base_model_name = args.base_model_name
+                print(f"Using provided base model: {base_model_name}")
+            else:
+                # Get the adapter config to find the base model name
+                peft_config = PeftConfig.from_pretrained(args.model_path)
+                base_model_name = peft_config.base_model_name_or_path
+                print(f"Using base model from adapter config: {base_model_name}")
+            
+            # Load the base model
+            if args.load_in_4bit:
+                # Load in 4-bit quantization
+                from transformers import BitsAndBytesConfig
+                
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16
+                )
+                
+                model = AutoModelForCausalLM.from_pretrained(
+                    base_model_name,
+                    device_map="auto",
+                    quantization_config=bnb_config
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(base_model_name).to(args.device)
+            
+            # Load the adapter on top of the base model
+            model = PeftModel.from_pretrained(model, args.model_path)
+            
+            # Get tokenizer from the base model
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        else:
+            # Load regular model
+            if args.load_in_4bit:
+                # Load in 4-bit quantization
+                from transformers import BitsAndBytesConfig
+                
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16
+                )
+                
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_path,
+                    device_map="auto",
+                    quantization_config=bnb_config
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(args.model_path).to(args.device)
+            
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        
+        # Ensure proper padding settings
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
         
         # Prepare test data
         print(f"Preparing test data from {args.test_data}")
         test_dataset, example_ids = prepare_test_data(args.test_data)
+        
+        # Debug: Print the structure of the first example
+        if len(test_dataset) > 0:
+            print("\nDebug - First example structure:")
+            first_example = test_dataset[0]
+            if isinstance(first_example, dict):
+                for key, value in first_example.items():
+                    if isinstance(value, dict):
+                        print(f"{key}: {type(value)} with keys {list(value.keys())}")
+                    elif isinstance(value, list) and len(value) > 0:
+                        print(f"{key}: list of length {len(value)}, first item type: {type(value[0])}")
+                    else:
+                        print(f"{key}: {type(value)}")
+            else:
+                print(f"Example features: {test_dataset.features}")
+                print(f"Example keys: {test_dataset[0].keys()}")
         
         # Log dataset info
         with open(log_file, 'a') as f:
@@ -837,31 +1035,121 @@ def main():
         print(f"Raw predictions saved to {raw_predictions_file}")
         
         # Format predictions for evaluation
-        formatted_predictions = format_predictions_for_evaluation(predictions, example_ids)
-        
-        # Save formatted predictions
-        formatted_predictions_file = os.path.join(args.output_dir, "formatted_predictions.json")
-        with open(formatted_predictions_file, 'w') as f:
-            json.dump(formatted_predictions, f, indent=2)
-        
-        print(f"Formatted predictions saved to {formatted_predictions_file}")
+        try:
+            formatted_predictions = format_predictions_for_evaluation(predictions, example_ids)
+            
+            # Save formatted predictions
+            formatted_predictions_file = os.path.join(args.output_dir, "formatted_predictions.json")
+            with open(formatted_predictions_file, 'w') as f:
+                json.dump(formatted_predictions, f, indent=2)
+            
+            print(f"Formatted predictions saved to {formatted_predictions_file}")
+        except Exception as e:
+            error_msg = f"Error during formatting predictions: {str(e)}"
+            print(error_msg)
+            with open(log_file, 'a') as f:
+                f.write(f"{error_msg}\n")
+                f.write(f"Traceback: {traceback.format_exc()}\n")
+            # Continue with a default empty formatted_predictions
+            formatted_predictions = [{"id": id, "predicted": "", "gold": ""} for id in example_ids]
         
         # Create final.json with the specified format
         final_predictions = []
         for i, example_id in enumerate(example_ids):
             try:
                 # Get the question from the test dataset
-                question = test_dataset[i].get("question", "") if isinstance(test_dataset[i], dict) else test_dataset[i]["question"]
+                question = ""
+                if isinstance(test_dataset[i], dict):
+                    if "question" in test_dataset[i]:
+                        question = test_dataset[i].get("question", "")
+                    elif "qa" in test_dataset[i]:
+                        # Check if qa is a string (JSON)
+                        if isinstance(test_dataset[i]["qa"], str):
+                            try:
+                                qa_dict = json.loads(test_dataset[i]["qa"])
+                                if isinstance(qa_dict, dict):
+                                    if "question" in qa_dict:
+                                        question = qa_dict["question"]
+                                    # Handle entries list from qa_0, qa_1 etc.
+                                    elif "entries" in qa_dict and isinstance(qa_dict["entries"], list) and len(qa_dict["entries"]) > 0:
+                                        first_entry = qa_dict["entries"][0]
+                                        if isinstance(first_entry, dict) and "question" in first_entry:
+                                            question = first_entry["question"]
+                            except json.JSONDecodeError:
+                                pass
+                        # Check if qa is a dict
+                        elif isinstance(test_dataset[i]["qa"], dict) and "question" in test_dataset[i]["qa"]:
+                            question = test_dataset[i]["qa"]["question"]
+                else:
+                    if "question" in test_dataset.column_names:
+                        question = test_dataset[i]["question"]
+                    elif "qa" in test_dataset.column_names:
+                        # Check if qa is a string (JSON)
+                        if isinstance(test_dataset[i]["qa"], str):
+                            try:
+                                qa_dict = json.loads(test_dataset[i]["qa"])
+                                if isinstance(qa_dict, dict):
+                                    if "question" in qa_dict:
+                                        question = qa_dict["question"]
+                                    # Handle entries list from qa_0, qa_1 etc.
+                                    elif "entries" in qa_dict and isinstance(qa_dict["entries"], list) and len(qa_dict["entries"]) > 0:
+                                        first_entry = qa_dict["entries"][0]
+                                        if isinstance(first_entry, dict) and "question" in first_entry:
+                                            question = first_entry["question"]
+                            except json.JSONDecodeError:
+                                pass
+                        # Check if qa is a dict
+                        elif isinstance(test_dataset[i]["qa"], dict) and "question" in test_dataset[i]["qa"]:
+                            question = test_dataset[i]["qa"]["question"]
+                
+                # Ensure question is a string
+                question = str(question) if question is not None else ""
                 
                 # Extract the answer from the prediction
                 answer = extract_answer(predictions[i])
+                # Ensure answer is a string
+                answer = str(answer) if answer is not None else ""
+                
+                # Try to get the golden answer from the test dataset
+                golden_answer = ""
+                if isinstance(test_dataset[i], dict):
+                    if "answer" in test_dataset[i]:
+                        golden_answer = str(test_dataset[i]["answer"]) if test_dataset[i]["answer"] is not None else ""
+                    elif "qa" in test_dataset[i]:
+                        # Check if qa is a string (JSON)
+                        if isinstance(test_dataset[i]["qa"], str):
+                            try:
+                                qa_dict = json.loads(test_dataset[i]["qa"])
+                                if isinstance(qa_dict, dict) and "answer" in qa_dict:
+                                    golden_answer = str(qa_dict["answer"]) if qa_dict["answer"] is not None else ""
+                            except json.JSONDecodeError:
+                                pass
+                        # Check if qa is a dict
+                        elif isinstance(test_dataset[i]["qa"], dict) and "answer" in test_dataset[i]["qa"]:
+                            golden_answer = str(test_dataset[i]["qa"]["answer"]) if test_dataset[i]["qa"]["answer"] is not None else ""
+                else:
+                    if "answer" in test_dataset.column_names:
+                        golden_answer = str(test_dataset[i]["answer"]) if test_dataset[i]["answer"] is not None else ""
+                    elif "qa" in test_dataset.column_names:
+                        # Check if qa is a string (JSON)
+                        if isinstance(test_dataset[i]["qa"], str):
+                            try:
+                                qa_dict = json.loads(test_dataset[i]["qa"])
+                                if isinstance(qa_dict, dict) and "answer" in qa_dict:
+                                    golden_answer = str(qa_dict["answer"]) if qa_dict["answer"] is not None else ""
+                            except json.JSONDecodeError:
+                                pass
+                        # Check if qa is a dict
+                        elif isinstance(test_dataset[i]["qa"], dict) and "answer" in test_dataset[i]["qa"]:
+                            golden_answer = str(test_dataset[i]["qa"]["answer"]) if test_dataset[i]["qa"]["answer"] is not None else ""
                 
                 # Create the final prediction entry
                 final_prediction = {
                     "qa": {
                         "id": example_id,
                         "question": question,
-                        "answer": answer
+                        "answer": answer,
+                        "golden_answer": golden_answer
                     }
                 }
                 
@@ -873,7 +1161,8 @@ def main():
                     "qa": {
                         "id": example_id,
                         "question": "",
-                        "answer": ""
+                        "answer": "",
+                        "golden_answer": ""
                     }
                 })
         
@@ -890,7 +1179,10 @@ def main():
             print(f"Example ID: {example_ids[i]}")
             print(f"Raw prediction: {predictions[i][:100]}...")
             print(f"Extracted program: {formatted_predictions[i]['predicted']}")
-            print(f"Final format: {final_predictions[i]['qa']}")
+            print(f"Final format:")
+            print(f"  - Question: {final_predictions[i]['qa']['question']}")
+            print(f"  - Predicted Answer: {final_predictions[i]['qa']['answer']}")
+            print(f"  - Golden Answer: {final_predictions[i]['qa']['golden_answer']}")
             print()
         
         # Log completion

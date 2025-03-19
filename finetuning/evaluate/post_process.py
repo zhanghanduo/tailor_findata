@@ -309,7 +309,15 @@ def extract_answer(text):
     """
     Extract the final answer from model output.
     Looks for content between <begin_of_answer> and <end_of_answer> tags.
+    Returns a string representation of the answer.
     """
+    # If input is None, return empty string
+    if text is None:
+        return ""
+    
+    # Ensure text is a string
+    text = str(text)
+    
     # Check if this is a Qwen model output and extract the assistant response first
     if "<|im_start|>" in text and "<|im_end|>" in text:
         # Extract the assistant's response
@@ -335,12 +343,12 @@ def extract_answer(text):
             
             if numbers:
                 # Use the last number as the answer (likely the result)
-                return numbers[-1]
+                return str(numbers[-1])
             else:
                 # If no numbers found, return N/A
                 return "N/A"
                 
-        return answer_text
+        return str(answer_text)
     
     # If no answer tags found, try to find numerical answers in the text
     # Look for patterns like "The answer is X" or "= X"
@@ -379,10 +387,14 @@ def extract_answer(text):
     # If all else fails, extract all numbers and return the last one
     numbers = re.findall(r'[-+]?\d*\.?\d+', text)
     if numbers:
-        return numbers[-1]
+        return str(numbers[-1])
     
-    # If no answer found, return N/A
-    return "N/A"
+    # Default return if no answer found
+    if text.strip() == "":
+        return "N/A"
+    
+    # Final fallback - just return the first 50 characters of the text
+    return str(text[:50]) + ("..." if len(text) > 50 else "")
 
 
 def clean_model_output(text):
@@ -633,89 +645,28 @@ def format_predictions_for_evaluation(predictions, example_ids):
             # Extract answer
             answer = extract_answer(pred)
             
+            # Ensure program tokens are strings
+            program_tokens = [str(token) for token in program_tokens]
+            
+            # Create formatted prediction
+            formatted_prediction = {
+                "id": str(example_id),
+                "predicted": program_tokens
+            }
+            
             # Debug output
             if i % 10 == 0:  # Print debug info for every 10th example
                 print(f"Example ID: {example_id}")
-                print(f"Extracted program tokens: {program_tokens}")
-                print(f"Extracted answer: {answer}")
-                print(f"First 100 chars of raw prediction: {pred[:100]}...")
-                print()
+                print(f"Program tokens: {program_tokens}")
+                print(f"Answer: {answer}")
             
-            # Check if we have valid program tokens
-            if program_tokens and program_tokens != ["EOF"]:
-                # Format tokens for evaluation
-                formatted_tokens = program_tokens
-                
-                # Add the formatted prediction
-                formatted_predictions.append({
-                    "id": example_id,
-                    "predicted": formatted_tokens
-                })
-            else:
-                # If no valid program tokens found, try to construct a program from the answer
-                if answer and answer != "N/A":
-                    try:
-                        # Try to parse the answer as a number
-                        float_answer = float(answer)
-                        
-                        # Look for numbers in the prediction text
-                        number_pattern = r'[-+]?\d*\.?\d+'
-                        numbers = re.findall(number_pattern, pred)
-                        
-                        # Filter out the answer itself and any numbers that are too large or small
-                        filtered_numbers = []
-                        for n in numbers:
-                            try:
-                                n_float = float(n)
-                                if n != answer and 0.01 <= n_float <= 1000000:
-                                    filtered_numbers.append(n)
-                            except ValueError:
-                                continue
-                        
-                        if len(filtered_numbers) >= 2:
-                            # Assume it's an addition if we can't determine the operation
-                            formatted_tokens = ["add(", filtered_numbers[0], filtered_numbers[1], ")", "EOF"]
-                            
-                            # Try to infer the operation by checking if the answer matches any operation result
-                            try:
-                                if abs(float(filtered_numbers[0]) + float(filtered_numbers[1]) - float_answer) < 0.01:
-                                    formatted_tokens = ["add(", filtered_numbers[0], filtered_numbers[1], ")", "EOF"]
-                                elif abs(float(filtered_numbers[0]) - float(filtered_numbers[1]) - float_answer) < 0.01:
-                                    formatted_tokens = ["subtract(", filtered_numbers[0], filtered_numbers[1], ")", "EOF"]
-                                elif abs(float(filtered_numbers[0]) * float(filtered_numbers[1]) - float_answer) < 0.01:
-                                    formatted_tokens = ["multiply(", filtered_numbers[0], filtered_numbers[1], ")", "EOF"]
-                                elif abs(float(filtered_numbers[0]) / float(filtered_numbers[1]) - float_answer) < 0.01:
-                                    formatted_tokens = ["divide(", filtered_numbers[0], filtered_numbers[1], ")", "EOF"]
-                            except (ValueError, ZeroDivisionError):
-                                # If calculation fails, stick with addition
-                                pass
-                            
-                            formatted_predictions.append({
-                                "id": example_id,
-                                "predicted": formatted_tokens
-                            })
-                        else:
-                            # If we can't find suitable numbers, just use EOF
-                            formatted_predictions.append({
-                                "id": example_id,
-                                "predicted": ["EOF"]
-                            })
-                    except (ValueError, ZeroDivisionError):
-                        # If we can't parse the answer as a number, just use EOF
-                        formatted_predictions.append({
-                            "id": example_id,
-                            "predicted": ["EOF"]
-                        })
-                else:
-                    # If no valid answer found, just use EOF
-                    formatted_predictions.append({
-                        "id": example_id,
-                        "predicted": ["EOF"]
-                    })
+            formatted_predictions.append(formatted_prediction)
+            
         except Exception as e:
-            print(f"Error processing example {example_id}: {e}")
+            print(f"Error formatting prediction for example {example_id}: {e}")
+            # Add a placeholder entry
             formatted_predictions.append({
-                "id": example_id,
+                "id": str(example_id),
                 "predicted": ["EOF"]
             })
     

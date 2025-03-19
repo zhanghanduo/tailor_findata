@@ -12,7 +12,7 @@ class OpenAIRAGSystem(RAGSystem):
     RAG system implementation that uses OpenAI's API for the language model.
     """
     
-    def __init__(self, knowledge_base_path: str, api_key: str = None, model: str = "gpt-3.5-turbo"):
+    def __init__(self, knowledge_base_path: str, api_key: str = None, model: str = "gpt-4o-mini-turbo"):
         """
         Initialize the OpenAI RAG system.
         

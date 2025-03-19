@@ -102,7 +102,7 @@ Answer with just the final result. Format your answer like this:
         # response = requests.post(
         #     "https://api.openai.com/v1/completions",
         #     headers={"Authorization": f"Bearer {self.api_key}"},
-        #     json={"model": "gpt-3.5-turbo", "prompt": prompt, "max_tokens": 100}
+        #     json={"model": "gpt-4o-mini-turbo", "prompt": prompt, "max_tokens": 100}
         # )
         # return response.json()["choices"][0]["text"]
         
